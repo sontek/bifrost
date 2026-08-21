@@ -12,6 +12,7 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Synthetic scope segment owning a Go package's module-level `var`, `const`
 /// and type-alias declarations, which have no enclosing type of their own.
@@ -252,20 +253,111 @@ fn nearest_go_module(file: &ProjectFile) -> Option<(String, String)> {
     let root = file.root();
     let abs = file.abs_path();
     let file_dir = abs.parent()?;
-    let mut cursor = file_dir;
-    loop {
+    let (anchor, module_path) = nearest_go_module_anchor(file_dir, root)?;
+    let rel_dir = file_dir
+        .strip_prefix(&anchor)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some((module_path, rel_dir))
+}
+
+/// A `go.mod`'s directory and the module path it declares -- what
+/// [`nearest_go_module_anchor`] resolves and [`nearest_go_module_cache`]
+/// memoizes.
+type GoModuleAnchor = (PathBuf, String);
+
+/// Per-directory memo of [`nearest_go_module_anchor`]'s answer, shared across
+/// every call in the process. The key is the directory's absolute path, so
+/// two different checkouts never collide on the same entry.
+///
+/// Without this cache, every file under a `go.mod`-less directory re-probes
+/// the same ancestor chain from scratch. On kubernetes/kubernetes (15.6k
+/// files, 35 modules, large `go.mod`-less `vendor/` trees), that repeated
+/// the same failed reads for every sibling file instead of once per
+/// directory.
+///
+/// The cache does not invalidate itself: call
+/// [`invalidate_nearest_go_module_cache`] wherever the file set changes.
+fn nearest_go_module_cache() -> &'static Mutex<HashMap<PathBuf, Option<GoModuleAnchor>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<GoModuleAnchor>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Drop every memoized `go.mod` answer. Call this wherever the file set
+/// changes -- an edited `go.mod`, a branch checkout, a workspace reload --
+/// alongside the caller's own cache rebuild. Otherwise
+/// [`canonical_go_package_name`] keeps returning pre-change answers for the
+/// rest of the process's life.
+pub fn invalidate_nearest_go_module_cache() {
+    nearest_go_module_cache()
+        .lock()
+        .expect("go module cache mutex")
+        .clear();
+}
+
+#[cfg(test)]
+static GO_MOD_PROBE_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn clear_nearest_go_module_cache_for_test() {
+    invalidate_nearest_go_module_cache();
+    GO_MOD_PROBE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn go_mod_probe_attempts_for_test() -> usize {
+    GO_MOD_PROBE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Walk from `dir` up to `root` looking for the nearest `go.mod`, returning
+/// the directory it was found in (the anchor a caller resolves its own
+/// relative path against) and its module path. Every directory visited on
+/// the way up is written back with the same answer, so a second file under
+/// any of them -- the common case, since Go files cluster densely per
+/// package/module -- resolves from the cache with no filesystem access.
+fn nearest_go_module_anchor(dir: &Path, root: &Path) -> Option<GoModuleAnchor> {
+    let cache = nearest_go_module_cache();
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut cursor = dir;
+    let result = loop {
+        let cached = cache
+            .lock()
+            .expect("go module cache mutex")
+            .get(cursor)
+            .cloned();
+        if let Some(result) = cached {
+            break result;
+        }
+        visited.push(cursor.to_path_buf());
+        #[cfg(test)]
+        GO_MOD_PROBE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(module_path) = read_go_module_path(cursor) {
-            let rel_dir = file_dir
-                .strip_prefix(cursor)
-                .ok()?
-                .to_string_lossy()
-                .replace('\\', "/");
-            return Some((module_path, rel_dir));
+            break Some((cursor.to_path_buf(), module_path));
         }
         if cursor == root {
-            return None;
+            break None;
         }
-        cursor = cursor.parent()?;
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break None,
+        }
+    };
+    backfill_nearest_go_module(cache, &visited, &result);
+    result
+}
+
+fn backfill_nearest_go_module(
+    cache: &Mutex<HashMap<PathBuf, Option<GoModuleAnchor>>>,
+    visited: &[PathBuf],
+    result: &Option<GoModuleAnchor>,
+) {
+    if visited.is_empty() {
+        return;
+    }
+    let mut guard = cache.lock().expect("go module cache mutex");
+    for dir in visited {
+        guard.entry(dir.clone()).or_insert_with(|| result.clone());
     }
 }
 
@@ -388,7 +480,166 @@ fn next_go_mod_token(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::go_module_path_from_source;
+    use super::{
+        canonical_go_package_name, clear_nearest_go_module_cache_for_test,
+        go_mod_probe_attempts_for_test, go_module_path_from_source,
+        invalidate_nearest_go_module_cache,
+    };
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    /// The `nearest_go_module` cache and probe counter are process-wide
+    /// statics, matching production. Tests that reset or read them must not
+    /// run concurrently with each other. Other tests in this module are
+    /// unaffected and still run in parallel.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_file(root: &std::path::Path, rel_path: &str, contents: &str) {
+        let path = root.join(rel_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn nearest_go_module_resolves_through_a_godotmod_less_ancestor_chain() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        clear_nearest_go_module_cache_for_test();
+        write_file(repo.path(), "go.mod", "module example.com/repo\n");
+        write_file(
+            repo.path(),
+            "pkg/storage/cacher/cacher.go",
+            "package cacher\n",
+        );
+
+        let file = ProjectFile::new(repo.path().to_path_buf(), "pkg/storage/cacher/cacher.go");
+        assert_eq!(
+            canonical_go_package_name(&file, "cacher"),
+            "example.com/repo/pkg/storage/cacher"
+        );
+    }
+
+    #[test]
+    fn sibling_files_reuse_the_cached_walk_instead_of_reprobing() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        clear_nearest_go_module_cache_for_test();
+        write_file(repo.path(), "go.mod", "module example.com/repo\n");
+        // Three files sharing a `go.mod`-less directory several levels below
+        // the real `go.mod`, mirroring a Go monorepo's `vendor/`-style
+        // layout: every one of them must walk up through the same ancestor
+        // directories to find it.
+        for name in ["a.go", "b.go", "c.go"] {
+            write_file(
+                repo.path(),
+                &format!("vendor/k8s.io/utils/strings/{name}"),
+                "package strings\n",
+            );
+        }
+
+        let package_names: Vec<String> = ["a.go", "b.go", "c.go"]
+            .iter()
+            .map(|name| {
+                let file = ProjectFile::new(
+                    repo.path().to_path_buf(),
+                    format!("vendor/k8s.io/utils/strings/{name}"),
+                );
+                canonical_go_package_name(&file, "strings")
+            })
+            .collect();
+
+        assert_eq!(
+            package_names,
+            vec![
+                "example.com/repo/vendor/k8s.io/utils/strings".to_string();
+                3
+            ]
+        );
+        // Directory depth from `vendor/k8s.io/utils/strings` up to the repo
+        // root (inclusive) is 5. The first file's walk must probe all 5; the
+        // second and third must each resolve entirely from the cache with no
+        // new probes, since every directory on their identical walk was
+        // already written back by the first.
+        assert_eq!(
+            go_mod_probe_attempts_for_test(),
+            5,
+            "sibling files under the same go.mod-less directory must not repeat the walk"
+        );
+    }
+
+    #[test]
+    fn different_repos_do_not_collide_in_the_shared_cache() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let left = TempDir::new().unwrap();
+        let right = TempDir::new().unwrap();
+        clear_nearest_go_module_cache_for_test();
+        write_file(left.path(), "go.mod", "module example.com/left\n");
+        write_file(left.path(), "pkg/foo.go", "package foo\n");
+        write_file(right.path(), "go.mod", "module example.com/right\n");
+        write_file(right.path(), "pkg/foo.go", "package foo\n");
+
+        let left_file = ProjectFile::new(left.path().to_path_buf(), "pkg/foo.go");
+        let right_file = ProjectFile::new(right.path().to_path_buf(), "pkg/foo.go");
+
+        // A package's import path is directory-scoped, not file-scoped: both
+        // files are named `foo.go` inside a `pkg/` directory, so the path is
+        // `.../pkg`, not `.../pkg/foo`.
+        assert_eq!(
+            canonical_go_package_name(&left_file, "foo"),
+            "example.com/left/pkg"
+        );
+        assert_eq!(
+            canonical_go_package_name(&right_file, "foo"),
+            "example.com/right/pkg"
+        );
+    }
+
+    #[test]
+    fn stale_cached_module_path_persists_until_invalidated_then_updates() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        clear_nearest_go_module_cache_for_test();
+        write_file(repo.path(), "go.mod", "module example.com/old\n");
+        write_file(repo.path(), "pkg/foo.go", "package foo\n");
+        let file = ProjectFile::new(repo.path().to_path_buf(), "pkg/foo.go");
+
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/old/pkg"
+        );
+
+        // An edited `go.mod` (a module rename, a branch checkout) without
+        // invalidating the cache: the pre-edit answer must keep coming back.
+        write_file(repo.path(), "go.mod", "module example.com/new\n");
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/old/pkg",
+            "an uninvalidated cache must still serve the pre-edit answer"
+        );
+
+        invalidate_nearest_go_module_cache();
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/new/pkg",
+            "invalidating the cache must pick up the edited go.mod"
+        );
+    }
+
+    #[test]
+    fn no_module_falls_back_to_directory_layout_and_still_caches() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        clear_nearest_go_module_cache_for_test();
+        write_file(repo.path(), "pkg/foo.go", "package foo\n");
+        write_file(repo.path(), "pkg/bar.go", "package foo\n");
+
+        let foo = ProjectFile::new(repo.path().to_path_buf(), "pkg/foo.go");
+        let bar = ProjectFile::new(repo.path().to_path_buf(), "pkg/bar.go");
+        assert_eq!(canonical_go_package_name(&foo, "foo"), "pkg");
+        assert_eq!(canonical_go_package_name(&bar, "foo"), "pkg");
+    }
 
     #[test]
     fn plain_module_path() {

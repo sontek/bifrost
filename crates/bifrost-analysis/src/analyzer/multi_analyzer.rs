@@ -211,6 +211,7 @@ impl AnalyzerDelegate {
             Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
             Self::Cpp(_) => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
             Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
+            Self::Go(_) => is_go_module_manifest(file),
             _ => false,
         }
     }
@@ -391,6 +392,13 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     matches!(
         file.rel_path().file_name().and_then(|name| name.to_str()),
         Some("tsconfig.json" | "jsconfig.json")
+    )
+}
+
+fn is_go_module_manifest(file: &ProjectFile) -> bool {
+    matches!(
+        file.rel_path().file_name().and_then(|name| name.to_str()),
+        Some("go.mod" | "go.sum")
     )
 }
 
@@ -2187,6 +2195,23 @@ mod tests {
         assert!(delegate.needs_config_update_for(&project_file("App.csproj")));
         assert!(delegate.needs_config_update_for(&project_file("bin/App.dll")));
         assert!(!delegate.needs_config_update_for(&project_file("src/App.cs")));
+    }
+
+    #[test]
+    fn go_module_manifest_changes_are_routed_as_delegate_relevant_changes() {
+        assert!(is_go_module_manifest(&project_file("go.mod")));
+        assert!(is_go_module_manifest(&project_file("go.sum")));
+        assert!(!is_go_module_manifest(&project_file("pkg/foo.go")));
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = FileSetProject::new(
+            temp.path().canonicalize().unwrap(),
+            std::iter::empty::<std::path::PathBuf>(),
+        );
+        let delegate = AnalyzerDelegate::Go(GoAnalyzer::from_project(project));
+        assert!(delegate.needs_config_update_for(&project_file("go.mod")));
+        assert!(delegate.needs_config_update_for(&project_file("go.sum")));
+        assert!(!delegate.needs_config_update_for(&project_file("pkg/foo.go")));
     }
 
     /// A two-language workspace on disk, as a `MultiAnalyzer` over real
