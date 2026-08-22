@@ -38,13 +38,6 @@ pub struct AnalyzeDiffParams {
     pub target: Option<String>,
     #[serde(default = "default_include_tests")]
     pub include_tests: bool,
-    /// Also compute `dependent_symbols` (code elsewhere that calls into a
-    /// symbol the diff edited or introduced). Off by default: unlike every
-    /// other field here, it is a best-effort, heuristic search across the
-    /// whole target tree, not a bounded read of the diff's own files, so it
-    /// costs meaningfully more than a plain `analyze_diff` call.
-    #[serde(default)]
-    pub include_dependents: bool,
 }
 
 /// Trusted host configuration for immutable `analyze_diff` endpoints.
@@ -66,12 +59,6 @@ pub struct DiffAnalysisResult {
     pub file_changes: Vec<FileChange>,
     pub patch_symbols: PatchSymbols,
     pub dependency_symbols: Vec<CommitSymbol>,
-    /// Declarations, outside the diff's own files, that call into a symbol
-    /// the diff edited or introduced, in the post-change state. Empty unless
-    /// `AnalyzeDiffParams::include_dependents` was set. Best-effort, unlike
-    /// the exact `dependency_symbols` -- see [`dependent_symbols`] for the
-    /// search this runs and its limits.
-    pub dependent_symbols: Vec<CommitSymbol>,
     pub import_changes: Vec<ImportChange>,
     /// The call-edge changes left over after every patch symbol took the edges
     /// it calls, such as an untouched function in a changed file whose callee
@@ -652,12 +639,6 @@ pub fn analyze_diff_at_root(
         graph_after.truncated_symbols,
     );
 
-    let dependent_symbols = if params.include_dependents {
-        dependent_symbols(repo, target, &target_image, &patch_symbols, params.include_tests)?
-    } else {
-        Vec::new()
-    };
-
     Ok(DiffAnalysisResult {
         endpoints: DiffEndpoints {
             base: base.label(),
@@ -666,172 +647,10 @@ pub fn analyze_diff_at_root(
         file_changes,
         patch_symbols,
         dependency_symbols,
-        dependent_symbols,
         import_changes,
         unattributed_call_edge_changes,
         large_callsite_symbols,
     })
-}
-
-/// Declarations, outside the diff's own files, that call into a symbol the
-/// diff edited or introduced.
-///
-/// This is a fundamentally different problem than `dependency_symbols`: the
-/// diff's own files can tell you exactly what they import, but nothing tells
-/// you who else in the repository might call into them. Finding out exactly
-/// would mean building a full-repo analyzer (measured at 150+ seconds on a
-/// large repository, the reason `include_dependents` defaults off), so this
-/// instead searches the target tree's raw text for each changed symbol's own
-/// bare name, treats a match as a candidate, and lets the real analyzer's
-/// usage graph -- already generic across languages -- resolve the precise
-/// edges once those candidates are loaded. A caller that never spells the
-/// symbol's own name in a way this text search catches (an aliased import, a
-/// wildcard-imported bare reference) is missed; this is a best-effort search,
-/// not a guarantee, unlike `dependency_symbols`.
-fn dependent_symbols(
-    repo: &Repository,
-    target: Snapshot,
-    target_image: &RevisionImage,
-    patch_symbols: &PatchSymbols,
-    include_tests: bool,
-) -> Result<Vec<CommitSymbol>, String> {
-    let changed_symbols: Vec<&CommitSymbol> = patch_symbols
-        .edited
-        .iter()
-        .map(|pair| &pair.after)
-        .chain(patch_symbols.introduced.iter().map(|record| &record.after))
-        .collect();
-    let names: BTreeSet<String> = changed_symbols
-        .iter()
-        .map(|symbol| bare_symbol_name(&symbol.fqn))
-        .collect();
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let already_loaded: BTreeSet<PathBuf> = target_image.files().iter().cloned().collect();
-    let candidates: Vec<PathBuf> = match target {
-        Snapshot::Commit(_) | Snapshot::Tree(_) => {
-            grep_tree_for_names(repo, &snapshot_tree(repo, target)?, &names, &already_loaded)?
-        }
-        Snapshot::Worktree => grep_dir_for_names(target_image.root(), &names, &already_loaded)?,
-    };
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let candidate_paths: Vec<String> = candidates
-        .iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    let widened_files: Vec<PathBuf> = match target {
-        Snapshot::Commit(_) | Snapshot::Tree(_) => {
-            let tree = snapshot_tree(repo, target)?;
-            let written = export_tree_paths(repo, &tree, target_image.root(), &candidate_paths)?;
-            target_image.files().iter().cloned().chain(written).collect()
-        }
-        Snapshot::Worktree => target_image
-            .files()
-            .iter()
-            .cloned()
-            .chain(candidates.iter().cloned())
-            .collect(),
-    };
-    let widened_analyzer = build_analyzer(target_image.root(), &widened_files)?;
-    let graph = usage_graph(
-        widened_analyzer.analyzer(),
-        UsageGraphParams {
-            include_tests,
-            paths: Some(candidate_paths),
-        },
-    );
-
-    let target_keys: BTreeSet<CallerKey> =
-        changed_symbols.iter().map(|symbol| symbol_edge_key(symbol)).collect();
-    let after = symbol_snapshot_map(widened_analyzer.analyzer(), include_tests);
-    let definitions = symbols_by_edge_key(&after);
-    let mut dependents: BTreeMap<String, CommitSymbol> = BTreeMap::new();
-    for edge in &graph.edges {
-        if !target_keys.contains(&(edge.to.clone(), edge.language.clone())) {
-            continue;
-        }
-        if let Some(symbol) = definitions.get(&(edge.from.clone(), edge.language.clone())) {
-            dependents.insert(symbol.fqn.clone(), (*symbol).clone());
-        }
-    }
-    let mut dependents: Vec<CommitSymbol> = dependents.into_values().collect();
-    sort_symbols(&mut dependents);
-    Ok(dependents)
-}
-
-/// The last path-ish segment of a fully-qualified name (`repro/pkgb.MakeThing`
-/// -> `MakeThing`), generic across every language's fqn separator (`.`, `::`,
-/// `/`) since we only need a literal a caller would plausibly spell, not a
-/// structured parse of the fqn.
-fn bare_symbol_name(fqn: &str) -> String {
-    fqn.rsplit(['.', ':', '/']).next().unwrap_or(fqn).to_string()
-}
-
-/// Every regular file in `tree`, not in `exclude`, whose raw text contains at
-/// least one of `names` as a literal substring.
-fn grep_tree_for_names(
-    repo: &Repository,
-    tree: &git2::Tree,
-    names: &BTreeSet<String>,
-    exclude: &BTreeSet<PathBuf>,
-) -> Result<Vec<PathBuf>, String> {
-    let mut matches = Vec::new();
-    tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
-        if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
-            return TreeWalkResult::Ok;
-        }
-        let Some(name) = entry.name() else {
-            return TreeWalkResult::Ok;
-        };
-        let rel = PathBuf::from(format!("{parent}{name}"));
-        if exclude.contains(&rel) {
-            return TreeWalkResult::Ok;
-        }
-        let Ok(blob) = repo.find_blob(entry.id()) else {
-            return TreeWalkResult::Ok;
-        };
-        let content = String::from_utf8_lossy(blob.content());
-        if names.iter().any(|needle| content.contains(needle.as_str())) {
-            matches.push(rel);
-        }
-        TreeWalkResult::Ok
-    })
-    .map_err(|err| format!("unable to search tree: {err}"))?;
-    Ok(matches)
-}
-
-/// Every analyzable file under `root`, not in `exclude`, whose raw text
-/// contains at least one of `names` as a literal substring. Filesystem analog
-/// of `grep_tree_for_names`, for the working-tree endpoint.
-fn grep_dir_for_names(
-    root: &Path,
-    names: &BTreeSet<String>,
-    exclude: &BTreeSet<PathBuf>,
-) -> Result<Vec<PathBuf>, String> {
-    let project = FilesystemProject::new(root)
-        .map_err(|err| format!("unable to list working tree {}: {err}", root.display()))?;
-    let files = project
-        .all_files()
-        .map_err(|err| format!("unable to list working tree {}: {err}", root.display()))?;
-    let mut matches = Vec::new();
-    for file in files {
-        let rel = file.rel_path();
-        if exclude.contains(rel) {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(root.join(rel)) else {
-            continue;
-        };
-        if names.iter().any(|needle| content.contains(needle.as_str())) {
-            matches.push(rel.to_path_buf());
-        }
-    }
-    Ok(matches)
 }
 
 struct DiffRepository {
@@ -1315,8 +1134,8 @@ fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
 ///
 /// This answers "what does the diff's own code now reference" -- not "what
 /// else references the diff", which needs a reverse index of the whole
-/// repository to answer cheaply, a different and harder problem (see
-/// `dependent_symbols`' grep-candidate mechanism for that direction).
+/// repository to answer cheaply, a different and harder problem than this
+/// one.
 ///
 /// `tree` distinguishes how a candidate's existence gets checked: against a
 /// snapshot's git tree for a committed endpoint (`Some`), or directly on disk
@@ -2870,7 +2689,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: None,
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -2881,7 +2699,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -2943,7 +2760,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: None,
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -2954,7 +2770,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3021,7 +2836,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3087,7 +2901,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: None,
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3101,116 +2914,6 @@ mod tests {
             "the working-tree sentinel must also see a newly-called function in \
              an untouched sibling package, got {:?}",
             sentinel.dependency_symbols
-        );
-    }
-
-    /// `dependent_symbols` is opt-in and defaults off: an untouched caller of
-    /// an edited function must not appear unless `include_dependents` is set,
-    /// even though the mechanism that would find it runs regardless of the
-    /// flag for `dependency_symbols`' own purposes.
-    #[test]
-    fn dependent_symbols_is_empty_unless_requested() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(dir.path().join("pkga")).unwrap();
-        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc Target() int { return 1 }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("pkgb/b.go"),
-            "package pkgb\n\nimport \"repro/pkga\"\n\nfunc Caller() int { return pkga.Target() }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 1");
-
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc Target() int { return 2 }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 2");
-        drop(repo);
-
-        let result = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: Some("HEAD".to_string()),
-                include_tests: true,
-                include_dependents: false,
-            },
-            &DiffAnalysisOptions::default(),
-        )
-        .expect("analyze_diff failed");
-
-        assert!(
-            result.dependent_symbols.is_empty(),
-            "dependent_symbols must stay empty when include_dependents is not set, got {:?}",
-            result.dependent_symbols
-        );
-    }
-
-    /// Same fixture, with `include_dependents: true`: `pkgb.Caller` calls
-    /// `pkga.Target` before the diff even starts, and the diff only edits
-    /// `Target`'s body. `Caller`'s own file is never part of the diff and was
-    /// never touched by any ambient/import-expansion mechanism, so finding it
-    /// depends entirely on the grep-candidate search in `dependent_symbols`.
-    #[test]
-    fn dependent_symbols_includes_an_existing_caller_of_an_edited_function() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = test_repo::init_repo(dir.path());
-        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(dir.path().join("pkga")).unwrap();
-        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc Target() int { return 1 }\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("pkgb/b.go"),
-            "package pkgb\n\nimport \"repro/pkga\"\n\nfunc Caller() int { return pkga.Target() }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 1");
-
-        fs::write(
-            dir.path().join("pkga/a.go"),
-            "package pkga\n\nfunc Target() int { return 2 }\n",
-        )
-        .unwrap();
-        test_repo::commit_all(&repo, "commit 2");
-        drop(repo);
-
-        let result = analyze_diff_at_root(
-            dir.path(),
-            AnalyzeDiffParams {
-                base: Some("HEAD~1".to_string()),
-                target: Some("HEAD".to_string()),
-                include_tests: true,
-                include_dependents: true,
-            },
-            &DiffAnalysisOptions::default(),
-        )
-        .expect("analyze_diff failed");
-
-        assert_eq!(
-            result.patch_symbols.edited.len(),
-            1,
-            "sanity check: Target itself must still be reported as edited"
-        );
-        assert!(
-            result
-                .dependent_symbols
-                .iter()
-                .any(|symbol| symbol.fqn.contains("Caller")),
-            "an existing caller of an edited function must appear in \
-             dependent_symbols when include_dependents is set, got {:?}",
-            result.dependent_symbols
         );
     }
 
@@ -3336,7 +3039,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3392,7 +3094,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3448,7 +3149,6 @@ mod tests {
                 base: Some("HEAD~1".to_string()),
                 target: Some("HEAD".to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -3978,7 +3678,6 @@ mod entry_point_tests {
                 base: None,
                 target: Some(head.to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -4074,7 +3773,6 @@ mod entry_point_tests {
                 base: Some(base.to_string()),
                 target: Some(head.to_string()),
                 include_tests: true,
-                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
