@@ -1,20 +1,22 @@
 use crate::analyzer::test_paths;
 use crate::analyzer::{AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
-use crate::{FileSetProject, WorkspaceAnalyzer};
+use crate::{FileSetProject, FilesystemProject, ImportInfo, Project, WorkspaceAnalyzer};
 use git2::{
     Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
     TreeWalkResult,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Endpoint label reported for the uncommitted working tree.
@@ -36,6 +38,13 @@ pub struct AnalyzeDiffParams {
     pub target: Option<String>,
     #[serde(default = "default_include_tests")]
     pub include_tests: bool,
+    /// Also compute `dependent_symbols` (code elsewhere that calls into a
+    /// symbol the diff edited or introduced). Off by default: unlike every
+    /// other field here, it is a best-effort, heuristic search across the
+    /// whole target tree, not a bounded read of the diff's own files, so it
+    /// costs meaningfully more than a plain `analyze_diff` call.
+    #[serde(default)]
+    pub include_dependents: bool,
 }
 
 /// Trusted host configuration for immutable `analyze_diff` endpoints.
@@ -57,6 +66,12 @@ pub struct DiffAnalysisResult {
     pub file_changes: Vec<FileChange>,
     pub patch_symbols: PatchSymbols,
     pub dependency_symbols: Vec<CommitSymbol>,
+    /// Declarations, outside the diff's own files, that call into a symbol
+    /// the diff edited or introduced, in the post-change state. Empty unless
+    /// `AnalyzeDiffParams::include_dependents` was set. Best-effort, unlike
+    /// the exact `dependency_symbols` -- see [`dependent_symbols`] for the
+    /// search this runs and its limits.
+    pub dependent_symbols: Vec<CommitSymbol>,
     pub import_changes: Vec<ImportChange>,
     /// The call-edge changes left over after every patch symbol took the edges
     /// it calls, such as an untouched function in a changed file whose callee
@@ -447,8 +462,8 @@ pub fn analyze_diff_at_root(
         .into_iter()
         .collect();
 
-    let base_image = RevisionImage::materialize(repo, base, &base_paths)?;
-    let target_image = RevisionImage::materialize(repo, target, &target_paths)?;
+    let base_image = RevisionImage::materialize(repo, base, Some(&base_paths))?;
+    let target_image = RevisionImage::materialize(repo, target, Some(&target_paths))?;
     let base_analyzer = build_analyzer(base_image.root(), base_image.files())?;
     let target_analyzer = build_analyzer(target_image.root(), target_image.files())?;
 
@@ -637,6 +652,12 @@ pub fn analyze_diff_at_root(
         graph_after.truncated_symbols,
     );
 
+    let dependent_symbols = if params.include_dependents {
+        dependent_symbols(repo, target, &target_image, &patch_symbols, params.include_tests)?
+    } else {
+        Vec::new()
+    };
+
     Ok(DiffAnalysisResult {
         endpoints: DiffEndpoints {
             base: base.label(),
@@ -645,10 +666,172 @@ pub fn analyze_diff_at_root(
         file_changes,
         patch_symbols,
         dependency_symbols,
+        dependent_symbols,
         import_changes,
         unattributed_call_edge_changes,
         large_callsite_symbols,
     })
+}
+
+/// Declarations, outside the diff's own files, that call into a symbol the
+/// diff edited or introduced.
+///
+/// This is a fundamentally different problem than `dependency_symbols`: the
+/// diff's own files can tell you exactly what they import, but nothing tells
+/// you who else in the repository might call into them. Finding out exactly
+/// would mean building a full-repo analyzer (measured at 150+ seconds on a
+/// large repository, the reason `include_dependents` defaults off), so this
+/// instead searches the target tree's raw text for each changed symbol's own
+/// bare name, treats a match as a candidate, and lets the real analyzer's
+/// usage graph -- already generic across languages -- resolve the precise
+/// edges once those candidates are loaded. A caller that never spells the
+/// symbol's own name in a way this text search catches (an aliased import, a
+/// wildcard-imported bare reference) is missed; this is a best-effort search,
+/// not a guarantee, unlike `dependency_symbols`.
+fn dependent_symbols(
+    repo: &Repository,
+    target: Snapshot,
+    target_image: &RevisionImage,
+    patch_symbols: &PatchSymbols,
+    include_tests: bool,
+) -> Result<Vec<CommitSymbol>, String> {
+    let changed_symbols: Vec<&CommitSymbol> = patch_symbols
+        .edited
+        .iter()
+        .map(|pair| &pair.after)
+        .chain(patch_symbols.introduced.iter().map(|record| &record.after))
+        .collect();
+    let names: BTreeSet<String> = changed_symbols
+        .iter()
+        .map(|symbol| bare_symbol_name(&symbol.fqn))
+        .collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let already_loaded: BTreeSet<PathBuf> = target_image.files().iter().cloned().collect();
+    let candidates: Vec<PathBuf> = match target {
+        Snapshot::Commit(_) | Snapshot::Tree(_) => {
+            grep_tree_for_names(repo, &snapshot_tree(repo, target)?, &names, &already_loaded)?
+        }
+        Snapshot::Worktree => grep_dir_for_names(target_image.root(), &names, &already_loaded)?,
+    };
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let candidate_paths: Vec<String> = candidates
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let widened_files: Vec<PathBuf> = match target {
+        Snapshot::Commit(_) | Snapshot::Tree(_) => {
+            let tree = snapshot_tree(repo, target)?;
+            let written = export_tree_paths(repo, &tree, target_image.root(), &candidate_paths)?;
+            target_image.files().iter().cloned().chain(written).collect()
+        }
+        Snapshot::Worktree => target_image
+            .files()
+            .iter()
+            .cloned()
+            .chain(candidates.iter().cloned())
+            .collect(),
+    };
+    let widened_analyzer = build_analyzer(target_image.root(), &widened_files)?;
+    let graph = usage_graph(
+        widened_analyzer.analyzer(),
+        UsageGraphParams {
+            include_tests,
+            paths: Some(candidate_paths),
+        },
+    );
+
+    let target_keys: BTreeSet<CallerKey> =
+        changed_symbols.iter().map(|symbol| symbol_edge_key(symbol)).collect();
+    let after = symbol_snapshot_map(widened_analyzer.analyzer(), include_tests);
+    let definitions = symbols_by_edge_key(&after);
+    let mut dependents: BTreeMap<String, CommitSymbol> = BTreeMap::new();
+    for edge in &graph.edges {
+        if !target_keys.contains(&(edge.to.clone(), edge.language.clone())) {
+            continue;
+        }
+        if let Some(symbol) = definitions.get(&(edge.from.clone(), edge.language.clone())) {
+            dependents.insert(symbol.fqn.clone(), (*symbol).clone());
+        }
+    }
+    let mut dependents: Vec<CommitSymbol> = dependents.into_values().collect();
+    sort_symbols(&mut dependents);
+    Ok(dependents)
+}
+
+/// The last path-ish segment of a fully-qualified name (`repro/pkgb.MakeThing`
+/// -> `MakeThing`), generic across every language's fqn separator (`.`, `::`,
+/// `/`) since we only need a literal a caller would plausibly spell, not a
+/// structured parse of the fqn.
+fn bare_symbol_name(fqn: &str) -> String {
+    fqn.rsplit(['.', ':', '/']).next().unwrap_or(fqn).to_string()
+}
+
+/// Every regular file in `tree`, not in `exclude`, whose raw text contains at
+/// least one of `names` as a literal substring.
+fn grep_tree_for_names(
+    repo: &Repository,
+    tree: &git2::Tree,
+    names: &BTreeSet<String>,
+    exclude: &BTreeSet<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut matches = Vec::new();
+    tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
+            return TreeWalkResult::Ok;
+        }
+        let Some(name) = entry.name() else {
+            return TreeWalkResult::Ok;
+        };
+        let rel = PathBuf::from(format!("{parent}{name}"));
+        if exclude.contains(&rel) {
+            return TreeWalkResult::Ok;
+        }
+        let Ok(blob) = repo.find_blob(entry.id()) else {
+            return TreeWalkResult::Ok;
+        };
+        let content = String::from_utf8_lossy(blob.content());
+        if names.iter().any(|needle| content.contains(needle.as_str())) {
+            matches.push(rel);
+        }
+        TreeWalkResult::Ok
+    })
+    .map_err(|err| format!("unable to search tree: {err}"))?;
+    Ok(matches)
+}
+
+/// Every analyzable file under `root`, not in `exclude`, whose raw text
+/// contains at least one of `names` as a literal substring. Filesystem analog
+/// of `grep_tree_for_names`, for the working-tree endpoint.
+fn grep_dir_for_names(
+    root: &Path,
+    names: &BTreeSet<String>,
+    exclude: &BTreeSet<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let project = FilesystemProject::new(root)
+        .map_err(|err| format!("unable to list working tree {}: {err}", root.display()))?;
+    let files = project
+        .all_files()
+        .map_err(|err| format!("unable to list working tree {}: {err}", root.display()))?;
+    let mut matches = Vec::new();
+    for file in files {
+        let rel = file.rel_path();
+        if exclude.contains(rel) {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        if names.iter().any(|needle| content.contains(needle.as_str())) {
+            matches.push(rel.to_path_buf());
+        }
+    }
+    Ok(matches)
 }
 
 struct DiffRepository {
@@ -853,12 +1036,15 @@ fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>
     }
 }
 
-/// An analyzable image of one diff endpoint, restricted to the changed files.
+/// An analyzable image of one diff endpoint.
 ///
 /// Immutable endpoints — a commit or a bare tree — are exported into a private
 /// temp directory from their resolved tree; the working-tree endpoint is
-/// analyzed in place from the real project root. Both sides stay restricted to
-/// the changed paths so the symbol and call-edge diffs compare like for like.
+/// analyzed in place from the real project root. Both sides carry the diff's
+/// own changed paths plus what `export_snapshot_files`/`worktree_files` add
+/// for name resolution and newly-referenced packages -- not the revision's
+/// entire file set, which stays correct only at whole-tree scale (see
+/// `export_revision`'s much larger cost budget).
 enum RevisionImage {
     Snapshot {
         temp: RevisionTempDir,
@@ -871,15 +1057,24 @@ enum RevisionImage {
 }
 
 impl RevisionImage {
+    /// `paths: None` exports every file in the snapshot, for `export_revision`'s
+    /// whole-tree policy gating. `paths: Some(_)` restricts the export to
+    /// those paths plus what's described above.
     fn materialize(
         repo: &Repository,
         snapshot: Snapshot,
-        paths: &[String],
+        paths: Option<&[String]>,
     ) -> Result<Self, String> {
         match snapshot {
             Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
                 let temp = RevisionTempDir::new(&oid.to_string())?;
-                let files = export_snapshot_files(repo, snapshot, temp.path(), paths)?;
+                let files = match paths {
+                    Some(paths) => export_snapshot_files(repo, snapshot, temp.path(), paths)?,
+                    None => {
+                        let all = all_tree_paths(repo, snapshot)?;
+                        export_tree_paths(repo, &snapshot_tree(repo, snapshot)?, temp.path(), &all)?
+                    }
+                };
                 Ok(Self::Snapshot { temp, files })
             }
             Snapshot::Worktree => {
@@ -890,7 +1085,22 @@ impl RevisionImage {
                             .to_string()
                     })?
                     .to_path_buf();
-                let files = worktree_files(&root, paths)?;
+                let files = match paths {
+                    Some(paths) => worktree_files(&root, paths)?,
+                    None => {
+                        let project = FilesystemProject::new(&root).map_err(|err| {
+                            format!("unable to list working tree {}: {err}", root.display())
+                        })?;
+                        project
+                            .all_files()
+                            .map_err(|err| {
+                                format!("unable to list working tree {}: {err}", root.display())
+                            })?
+                            .into_iter()
+                            .map(|file| file.rel_path().to_path_buf())
+                            .collect()
+                    }
+                };
                 Ok(Self::Worktree { root, files })
             }
         }
@@ -1010,34 +1220,36 @@ pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<Revision
             })?
     };
     let subtree = Snapshot::Tree(tree.id());
-    let mut paths = Vec::new();
-    tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
-        // Entries with non-UTF-8 names are skipped: every workspace-relative
-        // path in the analyzer and the policy report is a UTF-8 string, so
-        // such a file can never join a head finding anyway.
-        if entry.kind() == Some(ObjectType::Blob)
-            && is_regular_file_mode(entry.filemode())
-            && let Some(name) = entry.name()
-        {
-            paths.push(format!("{parent}{name}"));
-        }
-        TreeWalkResult::Ok
-    })
-    .map_err(|err| format!("unable to enumerate tree for revision `{revision}`: {err}"))?;
-    let image = RevisionImage::materialize(&repo, subtree, &paths)?;
+    let image = RevisionImage::materialize(&repo, subtree, None)?;
     Ok(RevisionExport {
         image,
         commit_id: commit_id.to_string(),
     })
 }
 
-/// Collect the changed paths that actually exist as regular files on disk.
+/// Every regular file anywhere under `dir`, recursively, as paths relative to
+/// `root`. Filesystem analog of [`tree_dir_file_paths`]; see its doc comment
+/// for why an import-expansion target needs a recursive walk rather than a
+/// direct-children listing.
+fn fs_dir_file_paths(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.path().strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect()
+}
+
+/// Collect the changed paths that actually exist as regular files on disk,
+/// plus everything [`ambient_ancestor_paths_fs`] and
+/// [`import_expansion_targets`] add for the same reasons `export_snapshot_files`
+/// does for a committed endpoint.
 ///
-/// A path deleted in the working tree still appears in the diff but has no file
-/// to analyze, so it is skipped the same way [`export_commit_files`] skips
-/// missing tree entries.
+/// A path deleted in the working tree still appears in the diff but has no
+/// file to analyze, so it is skipped the same way a missing tree entry is.
 fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
-    let mut present = Vec::new();
+    let mut present = BTreeSet::new();
+    let mut changed = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
         let absolute = root.join(&rel);
@@ -1045,10 +1257,283 @@ fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String>
             .map(|metadata| metadata.is_file())
             .unwrap_or(false);
         if is_regular_file {
-            present.push(rel);
+            present.insert(rel.clone());
+            changed.push(rel);
         }
     }
-    Ok(present)
+    present.extend(ambient_ancestor_paths_fs(root, paths));
+    for target in import_expansion_targets(root, None, &changed)? {
+        match target {
+            ImportExpansionTarget::Directory(dir) => {
+                present.extend(fs_dir_file_paths(root, &root.join(&dir)));
+            }
+            ImportExpansionTarget::File(file) => {
+                if root.join(&file).is_file() {
+                    present.insert(file);
+                }
+            }
+        }
+    }
+    Ok(present.into_iter().collect())
+}
+
+/// Every regular file sitting directly inside an ancestor directory of a
+/// changed path, up to `root`, deduplicated across `paths`. Filesystem analog
+/// of [`ambient_ancestor_paths`], for the working-tree endpoint.
+fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
+    let mut visited_dirs = BTreeSet::new();
+    let mut ambient = Vec::new();
+    for raw_path in paths {
+        let Ok(rel) = safe_tree_entry_path(raw_path) else {
+            continue;
+        };
+        let mut dir = rel.parent();
+        while let Some(current) = dir {
+            // See `ambient_ancestor_paths`: once a directory is revisited,
+            // the rest of this path's ancestors were already swept too.
+            if !visited_dirs.insert(current.to_path_buf()) {
+                break;
+            }
+            for entry in fs::read_dir(root.join(current)).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && let Ok(rel_file) = path.strip_prefix(root)
+                {
+                    ambient.push(rel_file.to_path_buf());
+                }
+            }
+            dir = current.parent();
+        }
+    }
+    ambient
+}
+
+/// Something an import's own repo-relative directory/file might resolve to,
+/// generic across languages: `paths`' own imports, discovered through each
+/// file's `ImportAnalysisProvider` -- the same interface every language's
+/// real analyzer already implements -- not per-language parsing.
+///
+/// This answers "what does the diff's own code now reference" -- not "what
+/// else references the diff", which needs a reverse index of the whole
+/// repository to answer cheaply, a different and harder problem (see
+/// `dependent_symbols`' grep-candidate mechanism for that direction).
+///
+/// `tree` distinguishes how a candidate's existence gets checked: against a
+/// snapshot's git tree for a committed endpoint (`Some`), or directly on disk
+/// for the working tree (`None`, where `root` already IS the project root).
+enum ImportExpansionTarget {
+    Directory(PathBuf),
+    File(PathBuf),
+}
+
+fn import_expansion_targets(
+    root: &Path,
+    tree: Option<&git2::Tree>,
+    changed_paths: &[PathBuf],
+) -> Result<Vec<ImportExpansionTarget>, String> {
+    let analyzer = build_analyzer(root, changed_paths)?;
+    let analyzer = analyzer.analyzer();
+    let Some(provider) = analyzer.import_analysis_provider() else {
+        return Ok(Vec::new());
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+
+    let mut targets = Vec::new();
+    for rel in changed_paths {
+        let Some(file) = analyzer.project().file_by_rel_path(rel) else {
+            continue;
+        };
+        let importing_dir = rel.parent().unwrap_or_else(|| Path::new(""));
+        for info in provider.import_info_of(token, &file) {
+            for import_target in import_targets(&info) {
+                let resolved = resolve_import_target(importing_dir, &import_target, |candidate| {
+                    match tree {
+                        Some(tree) => tree
+                            .get_path(candidate)
+                            .ok()
+                            .map(|entry| entry.kind() == Some(ObjectType::Tree)),
+                        None => {
+                            let absolute = root.join(candidate);
+                            absolute.exists().then(|| absolute.is_dir())
+                        }
+                    }
+                });
+                if let Some((path, is_directory)) = resolved {
+                    targets.push(if is_directory {
+                        ImportExpansionTarget::Directory(path)
+                    } else {
+                        ImportExpansionTarget::File(path)
+                    });
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+/// A best-effort guess at where an import points, used only to decide what
+/// extra tree paths to export before the diff's own real analyzer resolves
+/// calls normally -- not a replacement for each language's own resolver,
+/// which needs the target file to already exist to run at all (confirmed
+/// true for every language's `ImportAnalysisProvider` impl), so nothing can
+/// resolve an import "for real" before its target is exported anyway. A
+/// wrong guess here costs a harmless extra export; a missed one just falls
+/// back to today's baseline.
+#[derive(Debug)]
+enum ImportTarget {
+    /// Resolve relative to the importing file's own directory, climbing `up`
+    /// parent directories first (0 = same directory).
+    Relative { up: usize, rest: Vec<String> },
+    /// A logical/absolute path, tried as a suffix (longest first) against the
+    /// snapshot's real directory structure.
+    Absolute(Vec<String>),
+}
+
+/// `ImportTarget`s for one `ImportInfo`. Uses the structured segments most
+/// language adapters populate, normalizing two well-known shapes (Rust's
+/// leading `crate`/`self`/`super` segment, Python's leading-dot relative
+/// segment) rather than treating every language identically, and falls back
+/// to a quoted literal pulled out of `raw_snippet` for a language that never
+/// populates a structured path at all (JS/TS).
+fn import_targets(info: &ImportInfo) -> Vec<ImportTarget> {
+    if let Some(path) = &info.path
+        && let Some((first, rest)) = path.segments.split_first()
+    {
+        let dots = first.chars().take_while(|ch| *ch == '.').count();
+        if dots > 0 {
+            let mut rest = rest.to_vec();
+            let remainder = &first[dots..];
+            if !remainder.is_empty() {
+                rest.insert(0, remainder.to_string());
+            }
+            return vec![ImportTarget::Relative {
+                up: dots - 1,
+                rest,
+            }];
+        }
+        if matches!(first.as_str(), "crate" | "self" | "super") {
+            return if rest.is_empty() {
+                Vec::new()
+            } else {
+                vec![ImportTarget::Absolute(rest.to_vec())]
+            };
+        }
+        return vec![ImportTarget::Absolute(path.segments.clone())];
+    }
+    raw_snippet_import_target(&info.raw_snippet)
+        .into_iter()
+        .collect()
+}
+
+fn raw_snippet_import_target(raw: &str) -> Option<ImportTarget> {
+    static QUOTED_LITERAL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"['"]([^'"]+)['"]"#).expect("valid literal regex"));
+    let literal = QUOTED_LITERAL.captures(raw)?.get(1)?.as_str();
+    if !literal.starts_with('.') {
+        let segments = literal.split('/').map(String::from).collect();
+        return Some(ImportTarget::Absolute(segments));
+    }
+    let mut remaining = literal;
+    let mut up = 0usize;
+    loop {
+        if let Some(rest) = remaining.strip_prefix("../") {
+            up += 1;
+            remaining = rest;
+        } else if let Some(rest) = remaining.strip_prefix("./") {
+            remaining = rest;
+        } else {
+            break;
+        }
+    }
+    if remaining.starts_with('.') {
+        return None;
+    }
+    let rest = remaining
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(String::from)
+        .collect();
+    Some(ImportTarget::Relative { up, rest })
+}
+
+fn resolve_import_target(
+    importing_dir: &Path,
+    target: &ImportTarget,
+    mut exists: impl FnMut(&Path) -> Option<bool>,
+) -> Option<(PathBuf, bool)> {
+    match target {
+        ImportTarget::Relative { up, rest } => {
+            let mut dir = importing_dir.to_path_buf();
+            for _ in 0..*up {
+                dir = dir.parent()?.to_path_buf();
+            }
+            let candidate = rest.iter().fold(dir, |acc, segment| acc.join(segment));
+            resolve_candidate(&candidate, &mut exists)
+        }
+        // An absolute path's directory-meaningful part can sit at either end:
+        // Go names a package at the tail, behind a module prefix to strip
+        // (`k8s.io/kubernetes/pkg/controller` -> `pkg/controller`), while a
+        // `use`/`from`-style import often names a leaf item at the tail, with
+        // the directory as a prefix (`crate_b::make_thing` -> `crate_b`).
+        // Prefixes (longest first) catch the second shape; a full prefix scan
+        // costs nothing extra when the first shape is what actually matches,
+        // since every prefix attempt but one is a cheap tree/disk miss.
+        ImportTarget::Absolute(segments) => (1..=segments.len())
+            .rev()
+            .find_map(|end| {
+                let candidate = PathBuf::from(segments[..end].join("/"));
+                resolve_candidate(&candidate, &mut exists)
+            })
+            .or_else(|| {
+                (1..segments.len()).find_map(|start| {
+                    let candidate = PathBuf::from(segments[start..].join("/"));
+                    resolve_candidate(&candidate, &mut exists)
+                })
+            }),
+    }
+}
+
+/// `candidate` itself if it names a real entry, else `candidate` with a
+/// common source extension appended, for an import that omits the file
+/// suffix (JS/TS, and Python's dotted-module style).
+///
+/// `candidate` comes from parsing an import statement's own text -- content
+/// an attacker controls in any file under review, not a value this code
+/// constructed itself. An absolute literal (`import x from "/etc/passwd"`) or
+/// one carrying an embedded `..` (`"a/../../../../tmp"`, surviving because
+/// only a *leading* `./`/`../` run is stripped upstream) must never reach the
+/// `exists` closure: on the working-tree endpoint that closure joins
+/// `candidate` onto the real project root with `Path::join`, which discards
+/// the root entirely for an absolute argument and lets the OS resolve an
+/// embedded `..` past it, checking or walking a directory outside the
+/// project entirely. Rejecting anything but an all-`Normal`-component path
+/// here, before the first `exists` call, closes that off for every caller
+/// (git-tree and filesystem alike) in one place, matching the same
+/// containment `safe_tree_entry_path` already enforces for every other path
+/// this file writes to disk.
+fn resolve_candidate(
+    candidate: &Path,
+    exists: &mut impl FnMut(&Path) -> Option<bool>,
+) -> Option<(PathBuf, bool)> {
+    if candidate.as_os_str().is_empty()
+        || !candidate
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    if let Some(is_directory) = exists(candidate) {
+        return Some((candidate.to_path_buf(), is_directory));
+    }
+    const EXTENSIONS: &[&str] = &[
+        "go", "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "java", "kt", "scala", "cs",
+        "cpp", "cc", "h", "hpp", "php", "rb",
+    ];
+    EXTENSIONS.iter().find_map(|extension| {
+        let with_extension = candidate.with_extension(extension);
+        exists(&with_extension).map(|is_directory| (with_extension, is_directory))
+    })
 }
 
 struct RevisionTempDir {
@@ -1095,6 +1580,24 @@ impl Drop for RevisionTempDir {
     }
 }
 
+/// Every regular file path in `snapshot`'s tree, workspace-relative.
+fn all_tree_paths(repo: &Repository, snapshot: Snapshot) -> Result<Vec<String>, String> {
+    let tree = snapshot_tree(repo, snapshot)?;
+    Ok(tree_dir_file_paths(repo, &tree, Path::new("")))
+}
+
+/// Export `paths` from `snapshot`'s tree into `root`, plus every ambient
+/// manifest an ancestor directory up (see [`ambient_ancestor_paths`]) and
+/// every package `paths`' own imports concretely reference (see
+/// [`import_expansion_targets`]), which -- unlike the ambient export -- must
+/// join the returned list: an import's target needs to be a real, analyzed
+/// declaration for its callee to resolve, not just a file sitting on disk for
+/// a manifest reader to open.
+///
+/// A restricted export (just the diff's own changed paths) cannot resolve a
+/// symbol whose name or call graph depends on a file the diff never touches:
+/// a module/package manifest an ancestor directory up, or a callee that
+/// lives in some other, untouched file entirely.
 fn export_snapshot_files(
     repo: &Repository,
     snapshot: Snapshot,
@@ -1102,7 +1605,53 @@ fn export_snapshot_files(
     paths: &[String],
 ) -> Result<Vec<PathBuf>, String> {
     let tree = snapshot_tree(repo, snapshot)?;
-    let mut exported = Vec::new();
+    let mut exported = export_tree_paths(repo, &tree, root, paths)?;
+
+    // Ambient files join `exported` too: Go's own module-root discovery
+    // (`go_module_roots`) finds `go.mod` by filtering the project's file
+    // list, not by reading the filesystem directly, so a `go.mod` written to
+    // disk but left out of this list is invisible to it.
+    let mut already_exported: BTreeSet<String> = paths.iter().cloned().collect();
+    let ambient: Vec<String> = ambient_ancestor_paths(repo, &tree, paths)
+        .into_iter()
+        .filter(|path| !already_exported.contains(path))
+        .collect();
+    exported.extend(export_tree_paths(repo, &tree, root, &ambient)?);
+    already_exported.extend(ambient);
+
+    // Import expansion resolves against a manifest that just landed on disk
+    // above (a `go.mod`, a `Cargo.toml`, ...), so it only runs now.
+    let changed: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|path| safe_tree_entry_path(path).ok())
+        .collect();
+    let mut expansion = BTreeSet::new();
+    for target in import_expansion_targets(root, Some(&tree), &changed)? {
+        match target {
+            ImportExpansionTarget::Directory(dir) => {
+                expansion.extend(tree_dir_file_paths(repo, &tree, &dir));
+            }
+            ImportExpansionTarget::File(file) => {
+                expansion.insert(file.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let expansion: Vec<String> = expansion
+        .into_iter()
+        .filter(|path| !already_exported.contains(path))
+        .collect();
+    exported.extend(export_tree_paths(repo, &tree, root, &expansion)?);
+
+    Ok(exported)
+}
+
+fn export_tree_paths(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+    paths: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    let mut written = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
         let Ok(entry) = tree.get_path(&rel) else {
@@ -1120,9 +1669,98 @@ fn export_snapshot_files(
         }
         write_private_file(&path, blob.content())?;
         set_private_file_permissions(&path)?;
-        exported.push(rel);
+        written.push(rel);
     }
-    Ok(exported)
+    Ok(written)
+}
+
+/// Every regular file sitting directly inside an ancestor directory of a
+/// changed path, up to the snapshot root, deduplicated across `paths`.
+///
+/// This has no notion of what a "manifest" is named. A per-language file
+/// list would have to track every module/package/build file each analyzer
+/// might walk up to find (and every path-based variant, like a JVM Gradle
+/// lockfile under `gradle/dependency-locks/`) and would silently miss
+/// whichever one it forgot. Copying whatever an ancestor directory actually
+/// contains cannot miss a name it wasn't told about, and stays cheap because
+/// it is bounded by each changed path's own depth, not the size of the tree.
+fn ambient_ancestor_paths(repo: &Repository, tree: &git2::Tree, paths: &[String]) -> Vec<String> {
+    fn push_blobs(dir: &git2::Tree, prefix: &str, out: &mut Vec<String>) {
+        for entry in dir.iter() {
+            if entry.kind() == Some(ObjectType::Blob)
+                && is_regular_file_mode(entry.filemode())
+                && let Some(name) = entry.name()
+            {
+                out.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+
+    let mut visited_dirs = BTreeSet::new();
+    let mut ambient = Vec::new();
+    for raw_path in paths {
+        let Ok(rel) = safe_tree_entry_path(raw_path) else {
+            continue;
+        };
+        let mut dir = rel.parent();
+        while let Some(current) = dir {
+            // Every ancestor of an already-visited directory was visited
+            // in the same pass that visited it, so once we hit one, the
+            // rest of this path's ancestors were already swept too.
+            if !visited_dirs.insert(current.to_path_buf()) {
+                break;
+            }
+            if current.as_os_str().is_empty() {
+                push_blobs(tree, "", &mut ambient);
+            } else if let Ok(dir_tree) = tree
+                .get_path(current)
+                .and_then(|entry| entry.to_object(repo))
+                .and_then(|object| object.peel_to_tree())
+            {
+                push_blobs(&dir_tree, &format!("{}/", current.display()), &mut ambient);
+            }
+            dir = current.parent();
+        }
+    }
+    ambient
+}
+
+/// Every regular file anywhere under `dir` (workspace-relative), recursively.
+///
+/// An import-expansion target names a package, not a fixed layout: a Go
+/// package's files sit directly in one directory, but a Rust crate's own
+/// source lives a level down in `src/`, and a Java package is nested one
+/// directory per name segment. Walking the whole subtree once, instead of
+/// just its direct children, is correct for all of those without needing to
+/// know which shape a given language uses.
+fn tree_dir_file_paths(repo: &Repository, tree: &git2::Tree, dir: &Path) -> Vec<String> {
+    let dir_tree_id = if dir.as_os_str().is_empty() {
+        tree.id()
+    } else {
+        let Ok(entry) = tree.get_path(dir) else {
+            return Vec::new();
+        };
+        entry.id()
+    };
+    let Ok(dir_tree) = repo.find_tree(dir_tree_id) else {
+        return Vec::new();
+    };
+    let prefix = if dir.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", dir.display())
+    };
+    let mut paths = Vec::new();
+    let _ = dir_tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        if entry.kind() == Some(ObjectType::Blob)
+            && is_regular_file_mode(entry.filemode())
+            && let Some(name) = entry.name()
+        {
+            paths.push(format!("{prefix}{parent}{name}"));
+        }
+        TreeWalkResult::Ok
+    });
+    paths
 }
 
 fn create_private_dirs(root: &Path, parent: &Path) -> Result<(), String> {
@@ -1872,8 +2510,23 @@ struct CallEdgeDiff {
     dependency_symbols: Vec<CommitSymbol>,
 }
 
+/// `(fqn, ecosystem)` for `symbol`, matching how `UsageGraphEdge.language`
+/// identifies an endpoint.
+///
+/// This is deliberately not `(fqn, symbol.language)`. `CommitSymbol.language`
+/// is a per-dialect string ("typescript", "javascript"), but
+/// `UsageGraphEdge.language` is the shared-namespace ecosystem string
+/// (`"js_ts"` for both, `"jvm"` for Java/Kotlin/Scala) -- edges within one
+/// ecosystem can name each other directly, so identity has to live at that
+/// granularity. Keying this lookup by the per-dialect string instead means it
+/// can never match any edge for a multi-dialect ecosystem: `added_calls` and
+/// `dependency_symbols` come back structurally empty for every JS/TS (and
+/// Java/Kotlin/Scala) symbol, for any call edge at all, not just cross-file
+/// ones. Single-dialect ecosystems (Go, Rust, Python, ...) never hit this,
+/// since their dialect and ecosystem strings already coincide.
 fn symbol_edge_key(symbol: &CommitSymbol) -> CallerKey {
-    (symbol.fqn.clone(), symbol.language.clone())
+    let ecosystem = UsageEcosystem::of(path_language(Path::new(&symbol.path))).as_str();
+    (symbol.fqn.clone(), ecosystem.to_string())
 }
 
 /// `(preimage fqn, language) -> postimage fqn` for every symbol the patch moved
@@ -1969,7 +2622,7 @@ fn diff_call_edges(
             .or_default()
             .added
             .push(callee_change(edge));
-        if let Some(symbol) = definitions.get(&(edge.to.as_str(), edge.language.as_str())) {
+        if let Some(symbol) = definitions.get(&(edge.to.clone(), edge.language.clone())) {
             deps.insert(symbol.fqn.clone(), (*symbol).clone());
         }
     }
@@ -2077,10 +2730,10 @@ fn callee_change(edge: &UsageGraphEdge) -> CalleeChange {
 /// would have found.
 fn symbols_by_edge_key(
     symbols: &BTreeMap<SymbolKey, SymbolSnapshot>,
-) -> HashMap<(&str, &str), &CommitSymbol> {
-    let mut out: HashMap<(&str, &str), &CommitSymbol> = HashMap::new();
+) -> HashMap<CallerKey, &CommitSymbol> {
+    let mut out: HashMap<CallerKey, &CommitSymbol> = HashMap::new();
     for snapshot in symbols.values() {
-        out.entry((snapshot.key.fqn.as_str(), snapshot.key.language.as_str()))
+        out.entry(symbol_edge_key(&snapshot.symbol))
             .or_insert(&snapshot.symbol);
     }
     out
@@ -2171,14 +2824,646 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol, FileChange, RevisionTempDir,
-        SymbolKey, SymbolSnapshot, body_similarity, body_token_signature, create_private_dirs,
-        diff_local_idf, is_pure_line_shift, pair_endpoints, within_fuzzy_weight_ratio,
-        write_private_file,
+        AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol,
+        DiffAnalysisOptions, FileChange, ImportTarget, RevisionTempDir, SymbolKey, SymbolSnapshot,
+        analyze_diff_at_root, body_similarity, body_token_signature, create_private_dirs,
+        diff_local_idf, is_pure_line_shift, pair_endpoints, resolve_import_target,
+        within_fuzzy_weight_ratio, worktree_files, write_private_file,
     };
+    use brokk_bifrost_core::gitblob::test_repo;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// The working-tree sentinel (`target: None`) must report the same
+    /// `patch_symbols`/`dependency_symbols` as an equivalent explicit target,
+    /// for a working tree with no uncommitted changes. A Go file's fqn needs
+    /// its module's `go.mod` to resolve correctly; without it, `Caller`
+    /// resolves to two different names on the two sides of the pair
+    /// (`pkga.Caller` vs. the correctly module-qualified `repro/pkga.Caller`)
+    /// and looks like one symbol deleted and an unrelated one introduced.
+    #[test]
+    fn working_tree_sentinel_matches_explicit_target_for_a_go_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + 1 }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let sentinel = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: None,
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("sentinel analyze_diff failed");
+        let explicit = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("explicit-target analyze_diff failed");
+
+        assert_eq!(
+            explicit.patch_symbols.edited.len(),
+            1,
+            "control: explicit target must report Caller as edited"
+        );
+        assert_eq!(
+            sentinel.patch_symbols.edited.len(),
+            1,
+            "the working-tree sentinel must also report Caller as edited, not \
+             delete-and-reintroduce it under a different fqn"
+        );
+        assert_eq!(
+            sentinel.patch_symbols.edited[0].after.fqn, "repro/pkga.Caller",
+            "the reported fqn must be module-qualified"
+        );
+        assert_eq!(
+            sentinel.patch_symbols.edited[0].after.fqn,
+            explicit.patch_symbols.edited[0].after.fqn,
+            "the sentinel and an equivalent explicit target must agree on the fqn"
+        );
+    }
+
+    /// Same defect as the Go test above, for Rust: a crate's fqn needs its
+    /// `Cargo.toml` (via `nearest_crate`'s ancestor walk) to resolve as
+    /// crate-qualified rather than falling back to an unqualified name.
+    #[test]
+    fn working_tree_sentinel_matches_explicit_target_for_a_rust_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn helper() -> i32 { 1 }\npub fn caller() -> i32 { helper() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn helper() -> i32 { 1 }\npub fn caller() -> i32 { helper() + 1 }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let sentinel = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: None,
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("sentinel analyze_diff failed");
+        let explicit = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("explicit-target analyze_diff failed");
+
+        assert_eq!(
+            explicit.patch_symbols.edited.len(),
+            1,
+            "control: explicit target must report caller as edited"
+        );
+        assert_eq!(
+            sentinel.patch_symbols.edited.len(),
+            1,
+            "the working-tree sentinel must also report caller as edited, not \
+             delete-and-reintroduce it under a different fqn"
+        );
+        assert!(
+            sentinel.patch_symbols.edited[0].after.fqn.contains("repro"),
+            "the reported fqn must be crate-qualified, got {:?}",
+            sentinel.patch_symbols.edited[0].after.fqn
+        );
+        assert_eq!(
+            sentinel.patch_symbols.edited[0].after.fqn,
+            explicit.patch_symbols.edited[0].after.fqn,
+            "the sentinel and an equivalent explicit target must agree on the fqn"
+        );
+    }
+
+    /// A changed file that starts calling a function in an untouched sibling
+    /// package: `MakeThing`'s own file was never part of the diff, so
+    /// resolving the call and attaching its full definition both depend on
+    /// `import_expansion_targets` following the new `import "repro/pkgb"` to
+    /// `pkgb`'s directory and exporting it alongside the diff's own files.
+    #[test]
+    fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.go"),
+            "package pkgb\n\nfunc MakeThing(x int) int { return x }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + pkgb.MakeThing(2) }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert_eq!(
+            result.patch_symbols.edited.len(),
+            1,
+            "sanity check: Caller itself must still be reported as edited"
+        );
+        assert!(
+            result.patch_symbols.edited[0]
+                .added_calls
+                .iter()
+                .any(|call| call.to.contains("MakeThing")),
+            "the new call to MakeThing must be detected as an added call, got {:?}",
+            result.patch_symbols.edited[0].added_calls
+        );
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("MakeThing")),
+            "a newly-called function in an untouched sibling package must appear \
+             in dependency_symbols, got {:?}",
+            result.dependency_symbols
+        );
+    }
+
+    /// Same fixture as above, but through the working-tree sentinel: import
+    /// expansion must resolve identically on both endpoint kinds, not just
+    /// the explicit-target/explicit-target case above.
+    #[test]
+    fn working_tree_sentinel_also_sees_a_newly_called_function_in_an_untouched_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.go"),
+            "package pkgb\n\nfunc MakeThing(x int) int { return x }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + pkgb.MakeThing(2) }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let sentinel = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: None,
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("sentinel analyze_diff failed");
+
+        assert!(
+            sentinel
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("MakeThing")),
+            "the working-tree sentinel must also see a newly-called function in \
+             an untouched sibling package, got {:?}",
+            sentinel.dependency_symbols
+        );
+    }
+
+    /// `dependent_symbols` is opt-in and defaults off: an untouched caller of
+    /// an edited function must not appear unless `include_dependents` is set,
+    /// even though the mechanism that would find it runs regardless of the
+    /// flag for `dependency_symbols`' own purposes.
+    #[test]
+    fn dependent_symbols_is_empty_unless_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc Target() int { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.go"),
+            "package pkgb\n\nimport \"repro/pkga\"\n\nfunc Caller() int { return pkga.Target() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc Target() int { return 2 }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert!(
+            result.dependent_symbols.is_empty(),
+            "dependent_symbols must stay empty when include_dependents is not set, got {:?}",
+            result.dependent_symbols
+        );
+    }
+
+    /// Same fixture, with `include_dependents: true`: `pkgb.Caller` calls
+    /// `pkga.Target` before the diff even starts, and the diff only edits
+    /// `Target`'s body. `Caller`'s own file is never part of the diff and was
+    /// never touched by any ambient/import-expansion mechanism, so finding it
+    /// depends entirely on the grep-candidate search in `dependent_symbols`.
+    #[test]
+    fn dependent_symbols_includes_an_existing_caller_of_an_edited_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc Target() int { return 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.go"),
+            "package pkgb\n\nimport \"repro/pkga\"\n\nfunc Caller() int { return pkga.Target() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nfunc Target() int { return 2 }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: true,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert_eq!(
+            result.patch_symbols.edited.len(),
+            1,
+            "sanity check: Target itself must still be reported as edited"
+        );
+        assert!(
+            result
+                .dependent_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("Caller")),
+            "an existing caller of an edited function must appear in \
+             dependent_symbols when include_dependents is set, got {:?}",
+            result.dependent_symbols
+        );
+    }
+
+    /// A changed file's own import statement is attacker-controlled content
+    /// (any file in a diff under review), not something this code
+    /// constructed. An absolute-looking literal must never resolve to a real
+    /// absolute path: on the working-tree endpoint, `Path::join` on an
+    /// absolute argument discards `root` entirely, so an unvalidated
+    /// candidate here would let `worktree_files` return a path outside the
+    /// project -- which then panics deep inside `ProjectFile::new`'s
+    /// `assert!(!rel_path.is_absolute())` once fed to the analyzer.
+    #[test]
+    fn worktree_import_expansion_rejects_an_absolute_import_target() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{\"name\": \"repro\"}\n").unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            "import thing from \"/etc/passwd\";\nexport function caller() { return thing; }\n",
+        )
+        .unwrap();
+
+        let files = worktree_files(dir.path(), &["a.ts".to_string()])
+            .expect("worktree_files failed");
+
+        assert!(
+            files.iter().all(|file| file.is_relative()),
+            "worktree_files must never return an absolute path, got {files:?}"
+        );
+    }
+
+    /// Same attack, via an import whose literal carries an embedded `..`
+    /// rather than being outright absolute (`raw_snippet_import_target` only
+    /// strips a *leading* `./`/`../` run, so a later `..` survives into the
+    /// resolved candidate). Unit-tests `resolve_import_target` directly with
+    /// a spy `exists` closure: this is the choke point that must reject the
+    /// candidate *before* checking whether it exists, not after -- an
+    /// end-to-end assertion on `worktree_files`'s returned file list can't
+    /// tell the two apart, since a path that escapes to an unrelated real
+    /// directory (like `/tmp`) is *also* filtered out by an unrelated,
+    /// incidental `strip_prefix(root)` check further downstream, regardless
+    /// of whether this containment check exists at all.
+    #[test]
+    fn resolve_import_target_rejects_a_candidate_with_an_embedded_parent_dir_segment() {
+        // A permissive spy: everything "exists", so the only reason a
+        // `..`-carrying candidate would ever be absent from `calls` is
+        // `resolve_candidate` rejecting it up front, not a lucky `exists`
+        // miss. A short, safe suffix (`"tmp"` alone) is expected to resolve
+        // once the loop reaches it -- that is correct behavior, not the bug.
+        let target = ImportTarget::Absolute(
+            ["a", "..", "..", "..", "..", "..", "..", "tmp"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        );
+        let mut calls = Vec::new();
+        resolve_import_target(Path::new(""), &target, |candidate| {
+            calls.push(candidate.to_path_buf());
+            Some(true)
+        });
+
+        for candidate in &calls {
+            assert!(
+                candidate
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "resolve_candidate must never call `exists` with a path carrying a `..` \
+                 segment, but it was called with {candidate:?}"
+            );
+        }
+    }
+
+    /// Same shape as the Go fixture, for Rust: `use crate_b::make_thing` names
+    /// an item at the end of its path, with the crate directory as a *prefix*
+    /// -- the opposite shape from Go's module-prefixed package path -- so this
+    /// specifically exercises `resolve_import_target`'s prefix search, not
+    /// just its suffix search.
+    #[test]
+    fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crate_a\", \"crate_b\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("crate_a/src")).unwrap();
+        fs::write(
+            dir.path().join("crate_a/Cargo.toml"),
+            "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\ncrate_b = { path = \"../crate_b\" }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("crate_b/src")).unwrap();
+        fs::write(
+            dir.path().join("crate_b/Cargo.toml"),
+            "[package]\nname = \"crate_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("crate_b/src/lib.rs"),
+            "pub fn make_thing(x: i32) -> i32 { x }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("crate_a/src/lib.rs"),
+            "fn helper() -> i32 { 1 }\npub fn caller() -> i32 { helper() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("crate_a/src/lib.rs"),
+            "use crate_b::make_thing;\n\nfn helper() -> i32 { 1 }\n\
+             pub fn caller() -> i32 { helper() + make_thing(2) }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("make_thing")),
+            "a newly-called function in an untouched crate must appear in \
+             dependency_symbols, got {:?}",
+            result.dependency_symbols
+        );
+    }
+
+    /// Same shape again, for Python: `from pkgb.b import make_thing` has no
+    /// leading dots (an absolute import), so this exercises the plain
+    /// structured-segments path rather than the relative-import handling.
+    #[test]
+    fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_python_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("pyproject.toml"), "[project]\nname = \"repro\"\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(dir.path().join("pkga/__init__.py"), "").unwrap();
+        fs::write(dir.path().join("pkgb/__init__.py"), "").unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.py"),
+            "def make_thing(x):\n    return x\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkga/a.py"),
+            "def helper():\n    return 1\n\n\ndef caller():\n    return helper()\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("pkga/a.py"),
+            "from pkgb.b import make_thing\n\n\ndef helper():\n    return 1\n\n\n\
+             def caller():\n    return helper() + make_thing(2)\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("make_thing")),
+            "a newly-called function in an untouched Python package must appear \
+             in dependency_symbols, got {:?}",
+            result.dependency_symbols
+        );
+    }
+
+    /// Same shape again, for TypeScript: `ImportInfo.path` is never populated
+    /// for JS/TS (confirmed by inspection of bifrost-js-ts), so this
+    /// specifically exercises the `raw_snippet` regex fallback, not the
+    /// structured-segments path every other language test above uses.
+    #[test]
+    fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_ts_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("package.json"), "{\"name\": \"repro\"}\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkgb/other.ts"),
+            "export function makeThing(x: number): number { return x; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("a.ts"),
+            "function helper(): number { return 1; }\n\
+             export function caller(): number { return helper(); }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+
+        fs::write(
+            dir.path().join("a.ts"),
+            "import { makeThing } from './pkgb/other';\n\n\
+             function helper(): number { return 1; }\n\
+             export function caller(): number { return helper() + makeThing(2); }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2");
+        drop(repo);
+
+        let result = analyze_diff_at_root(
+            dir.path(),
+            AnalyzeDiffParams {
+                base: Some("HEAD~1".to_string()),
+                target: Some("HEAD".to_string()),
+                include_tests: true,
+                include_dependents: false,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .expect("analyze_diff failed");
+
+        assert!(
+            result
+                .dependency_symbols
+                .iter()
+                .any(|symbol| symbol.fqn.contains("makeThing")),
+            "a newly-called function in an untouched TS module must appear in \
+             dependency_symbols, got {:?}",
+            result.dependency_symbols
+        );
+    }
 
     /// Tokenize with the production normalizer, then score -- the path a real
     /// symbol body takes. The df pool is just the two bodies, the smallest
@@ -2693,6 +3978,7 @@ mod entry_point_tests {
                 base: None,
                 target: Some(head.to_string()),
                 include_tests: true,
+                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
@@ -2788,6 +4074,7 @@ mod entry_point_tests {
                 base: Some(base.to_string()),
                 target: Some(head.to_string()),
                 include_tests: true,
+                include_dependents: false,
             },
             &DiffAnalysisOptions::default(),
         )
