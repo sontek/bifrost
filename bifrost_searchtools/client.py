@@ -1161,3 +1161,19 @@ def tool_descriptors(
     if not isinstance(decoded, list):
         raise SearchToolsError("Native tool descriptor call did not return a JSON array")
     return decoded
+
+
+def extensions_for_paths(
+    paths: list[str],
+    *,
+    library_path: Path | str | None = None,
+) -> list[str]:
+    """Every file extension for the language(s) present among `paths`, including reference-only
+    siblings (e.g. TypeScript/JavaScript's `.vue`/`.svelte`). Derived from bifrost's own language
+    table, not a caller-maintained copy of it. Pure -- opens no workspace -- so a caller can use it
+    to scope a `SearchToolsClient`'s `sources` to a diff's own language(s) before paying the cost
+    of indexing anything else, e.g. a backend-only diff need not index an unrelated frontend."""
+    native = _load_native_module(
+        Path(library_path).expanduser().resolve() if library_path is not None else None
+    )
+    return list(native.extensions_for_paths(list(paths)))

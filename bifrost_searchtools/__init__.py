@@ -3,6 +3,7 @@ from .client import (
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
+    extensions_for_paths,
     tool_descriptors,
 )
 from .models import (
@@ -235,6 +236,7 @@ __all__ = [
     "DiffEndpoints",
     "DirectoryListingEntry",
     "EditedSymbolPair",
+    "extensions_for_paths",
     "NavigationOperation",
     "FileContent",
     "FileChange",
