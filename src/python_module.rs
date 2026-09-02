@@ -122,6 +122,7 @@ fn tool_descriptors_json(toolset: &str, render_line_numbers: bool) -> PyResult<S
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::ensure_global_rayon_pool();
     module.add_class::<SearchToolsNativeSession>()?;
     module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
     Ok(())

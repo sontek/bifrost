@@ -100,6 +100,7 @@ pub use config::{
     PhpAnalyzerConfig, PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
     PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
     RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
+    ensure_global_rayon_pool,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
