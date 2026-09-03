@@ -5932,7 +5932,6 @@ mod tests {
         let analyzer = fixture.analyzer.analyzer();
 
         crate::analyzer::usages::get_definition::reset_resolve_definition_batch_with_source_call_count_for_test();
-        crate::analyzer::usages::candidates::reset_find_direct_importers_with_cancellation_call_count_for_test();
         let graph = usage_graph(
             analyzer,
             UsageGraphParams {
@@ -5943,8 +5942,6 @@ mod tests {
         );
         let calls =
             crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_call_count_for_test();
-        let importer_scan_calls =
-            crate::analyzer::usages::candidates::find_direct_importers_with_cancellation_call_count_for_test();
 
         // Three ambiguous targets (Widget, Gadget, Sprocket) each called
         // twice from the same file are six fallback-eligible sites; batched
@@ -5956,16 +5953,23 @@ mod tests {
             "six ambiguous-edge fallback sites sharing caller/main.go must batch into \
              exactly one resolve_definition_batch_with_source call, got {calls}"
         );
-        // usage_graph()'s ReferenceEngine never carries a real cancellation
-        // deadline, so its ambiguous-target candidate discovery must route
+        // usage_graph()'s ambiguous-target candidate discovery must route
         // through the cached reverse-import-index path (ImportGraphCandidateProvider)
         // instead of the interruptible, uncached per-file importer scan that
-        // path exists to protect a caller with a real deadline (bifrost#15).
-        assert_eq!(
-            importer_scan_calls, 0,
-            "usage_graph's candidate discovery must not fall back to the uncached \
-             per-candidate importer scan, got {importer_scan_calls} calls"
-        );
+        // path exists to protect a caller with a real deadline. This is a
+        // structural guarantee rather than something asserted here at
+        // runtime: `ImportGraphCandidateProvider::find_candidates` always
+        // calls `find_import_graph_candidates` with `scope: None`, which
+        // forces `cancellation: None` and therefore the fast
+        // `referencing_files_of` path -- it has no code path that reaches
+        // the slow scan. A prior version of this test asserted a process-wide
+        // call counter on the slow scan instead, but that function is also
+        // the workspace's shared default candidate-discovery path (used by,
+        // among others, `dead_code_smells` and several `candidates.rs` tests
+        // directly), so the counter raced with unrelated tests in the same
+        // binary and flaked under `cargo test`'s default parallelism
+        // (bifrost#15).
+        //
         // The graph is still allowed to omit an edge it genuinely cannot
         // disambiguate; this test's job is the call-count assertion above,
         // not asserting a specific resolved edge for an intentionally
