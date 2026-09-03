@@ -35,6 +35,30 @@ pub trait CodeUnitIndex: Send + Sync {
         self.analyzed_files().into_iter().collect()
     }
 
+    /// This analyzer's own files for one language, in path order.
+    ///
+    /// The default filters and sorts `analyzed_files`, which is right for an
+    /// analyzer that only ever holds one language. A multi-language analyzer
+    /// overrides this to go straight to the delegate that owns `language`
+    /// instead: the default's `analyzed_files` already fans out across every
+    /// delegate and sorts the combined result, so filtering it back down to
+    /// one language re-pays that whole-workspace, every-language fan-out and
+    /// sort for an answer only one delegate's own (already sorted) file list
+    /// could give directly. A usage query that calls this once per candidate
+    /// declaration -- once per ambiguous target's every overload, on a
+    /// workspace with heavy same-name duplication -- turns that into
+    /// thousands of repeats of the same whole-workspace scan (issue #1738's
+    /// shape, one call site further out).
+    fn analyzed_files_for_language(&self, language: Language) -> Vec<ProjectFile> {
+        let mut files: Vec<ProjectFile> = self
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| crate::analyzer::common::language_for_file(file) == language)
+            .collect();
+        files.sort();
+        files
+    }
+
     /// Whether `file` is one this analyzer has indexed. The default scans
     /// `analyzed_files`; concrete analyzers override with an O(1) lookup so
     /// incremental callers don't pay O(repo) per changed file.
