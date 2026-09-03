@@ -456,6 +456,13 @@ pub struct MultiAnalyzer {
     /// `query_contexts`, which a clone starts empty, so it is minted fresh per
     /// clone rather than shared.
     attached_read_ledgers: AtomicUsize,
+    /// One delegate's own file list is already sorted and single-language;
+    /// `analyzed_files_for_language`'s override only has to look it up, but
+    /// still re-sorted it on every call until this memoized it (bifrost#15).
+    /// Shared like `snapshot_caches`: cloned by reference across a clone of
+    /// the same snapshot, rebuilt fresh whenever the snapshot itself is.
+    analyzed_files_by_language:
+        Arc<brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo<Language, Vec<ProjectFile>>>,
 }
 
 impl Default for MultiAnalyzer {
@@ -473,6 +480,7 @@ impl Clone for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
         }
     }
 }
@@ -514,6 +522,9 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::new(
+                brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
+            ),
         }
     }
 
@@ -560,6 +571,9 @@ impl MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::new(
+                brokk_bifrost_core::analyzer::pool_memo::KeyedPoolSafeMemo::new(),
+            ),
         }
     }
 
@@ -1246,6 +1260,36 @@ impl CodeUnitIndex for MultiAnalyzer {
         files
     }
 
+    /// Goes straight to the delegate that owns `language` instead of the
+    /// default's fan-out-every-language-then-filter, which would otherwise
+    /// re-pay the whole-workspace, every-language scan and sort above for an
+    /// answer only this one (already single-language) delegate can give
+    /// directly (issue #1738's shape, one call site further out -- see
+    /// `CodeUnitIndex::analyzed_files_for_language`'s default).
+    ///
+    /// Memoized per language: a caller that asks this once per candidate
+    /// declaration -- once per ambiguous target's every overload, on a
+    /// workspace with heavy same-name duplication -- would otherwise still
+    /// re-sort the same (already single-language) file list from scratch on
+    /// every call. `analyzed_files_by_language` shares `snapshot_caches`'s
+    /// lifetime: valid as long as this snapshot is (bifrost#15).
+    fn analyzed_files_for_language(&self, language: Language) -> Vec<ProjectFile> {
+        if !self.delegates.contains_key(&language) {
+            return Vec::new();
+        }
+        let cell = self.analyzed_files_by_language.cell(&language);
+        let build = || {
+            let mut files = self
+                .delegates
+                .get(&language)
+                .map(|delegate| delegate.analyzer().analyzed_files())
+                .unwrap_or_default();
+            files.sort();
+            files
+        };
+        (*cell.get_or_build(build, build)).clone()
+    }
+
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.delegate_for_file(file)
             .and_then(|delegate| delegate.analyzer().indexed_source(file))
@@ -1614,6 +1658,12 @@ impl IAnalyzer for MultiAnalyzer {
         self.attached_read_ledgers.load(Ordering::Relaxed) > 0
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().prefetch_definitions(fq_names));
+    }
+
     fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
         self.query_contexts
             .lock()
@@ -1896,6 +1946,7 @@ impl IAnalyzer for MultiAnalyzer {
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
             attached_read_ledgers: AtomicUsize::new(0),
+            analyzed_files_by_language: Arc::clone(&self.analyzed_files_by_language),
         }
     }
 
@@ -2511,6 +2562,48 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .analyzer()
                     .test_hooks()
                     .definition_candidates_query_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_definition_prefetch_batch_count_for_test();
+        }
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .definition_prefetch_batch_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_relational_definition_batch_call_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_relational_definition_batch_call_count_for_test();
+        }
+    }
+
+    fn relational_definition_batch_call_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .relational_definition_batch_call_count_for_test()
             })
             .sum()
     }
