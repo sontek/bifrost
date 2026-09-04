@@ -201,8 +201,8 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
 /// and is filtering a single row's worth of work; a batched query has no
 /// such view open already, and joining the wide view here would make SQLite
 /// materialize its content and anchored arms too before this query's own
-/// `path_symbol_units`-only predicate ever runs. Issue #2794
-/// (`mounted_declaration_scan_seeks_live_workspace_files` in `store/mod.rs`)
+/// `path_symbol_units`-only predicate ever runs.
+/// `mounted_declaration_scan_seeks_live_workspace_files` in `store/mod.rs`
 /// measured exactly that compound-view materialization tax at 89.4 minutes
 /// on a 802K-row `code_units` table for a different caller of the same wide
 /// view; the lean views avoid it by construction, since they never
@@ -2041,7 +2041,7 @@ mod tests {
         );
     }
 
-    /// Regression pin for issue #20: `set_exact_definition_values`,
+    /// Regression pin: `set_exact_definition_values`,
     /// `set_normalized_definition_values`, and `set_structural_member_values`
     /// each merge in a path-synthetic module's row via
     /// [`batched_path_units_sql`]. That query must read the lean
@@ -2049,9 +2049,9 @@ mod tests {
     /// views (one row per file), never a wide `live_definition_*` compound
     /// view -- joining the wide view here would make SQLite materialize its
     /// content and anchored arms too before this query's own predicate ever
-    /// runs, the same compound-view tax issue #2794
-    /// (`mounted_declaration_scan_seeks_live_workspace_files` in
-    /// `store/mod.rs`) measured at 89.4 minutes on a 802K-row `code_units`
+    /// runs, the same compound-view tax
+    /// `mounted_declaration_scan_seeks_live_workspace_files` in
+    /// `store/mod.rs` measured at 89.4 minutes on a 802K-row `code_units`
     /// table for a different caller. If `batched_path_units_sql`'s callers ever
     /// point back at a wide view, this plan starts referencing `units` and
     /// `code_units`/`workspace_file_anchors`, and this test fails.

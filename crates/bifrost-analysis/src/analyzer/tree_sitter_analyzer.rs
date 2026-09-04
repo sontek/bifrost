@@ -14269,7 +14269,7 @@ mod tests {
     /// come in faster than the one batched query's CTE materialization and
     /// join overhead. The regression this fixes is disk- and
     /// concurrency-bound, not CPU-bound: a live 30-second `sample` against a
-    /// real large Python repository (evidence in bifrost issue #20) caught
+    /// real large Python repository caught
     /// one thread pinned inside this exact point-query call chain for the
     /// full sample window while every other worker thread sat idle, on a
     /// database far too large to stay resident in page cache and under
