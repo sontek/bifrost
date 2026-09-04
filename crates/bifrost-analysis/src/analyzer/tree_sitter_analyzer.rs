@@ -14173,6 +14173,84 @@ mod tests {
         );
     }
 
+    /// A path-synthetic module is a legitimate structural member of its
+    /// containing package: `AnalyzerDefinitionLookup::members` queries a
+    /// package's own relational name as a `StructuralMembers` owner to find
+    /// its submodules. `set_structural_member_values` must still find one
+    /// once a batch reaches `SET_QUERY_MIN_REQUESTS`, the same way
+    /// `set_exact_definition_values` and `set_normalized_definition_values`
+    /// do for direct exact/normalized-name lookups.
+    #[test]
+    fn relational_batch_set_queries_find_path_synthetic_submodule_as_structural_member() {
+        use crate::analyzer::languages::package_fq_name;
+        use crate::analyzer::python::PythonAdapter;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "pkg/__init__.py")
+            .write("")
+            .expect("write package init");
+        ProjectFile::new(root.clone(), "pkg/sub.py")
+            .write("value = 1\n")
+            .expect("write submodule fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let submodule = declarations
+            .iter()
+            .find(|unit| unit.is_module() && unit.fq_name() == "pkg.sub")
+            .cloned()
+            .expect("pkg/sub.py synthesizes a pkg.sub module");
+
+        let scope = DefinitionLanguageScope::Language(Language::Python);
+        let owner = RelationalName::stable(package_fq_name(Language::Python, "pkg"));
+        // SET_QUERY_MIN_REQUESTS: pad the batch so the real lookup shares one
+        // set query instead of taking the (already-correct) point-query path.
+        let mut requests = Vec::new();
+        for index in 0..64usize {
+            let (name, identifier) = if index == 0 {
+                (owner.clone(), "sub".to_string())
+            } else {
+                (
+                    RelationalName::stable(
+                        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                            Language::Python,
+                            &format!("missing_pkg_{index}"),
+                            crate::analyzer::fq_name::segment_interner(),
+                        ),
+                    ),
+                    "missing_member".to_string(),
+                )
+            };
+            requests.push(RelationalDefinitionRequest {
+                ordinal: requests.len(),
+                language_scope: scope.clone(),
+                name,
+                query: RelationalDefinitionQuery::StructuralMembers { identifier },
+            });
+        }
+
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&requests, &CancellationToken::new())
+        else {
+            panic!("set-shaped relational batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(members) = &results[0].value else {
+            panic!("structural-members query returned the wrong value shape")
+        };
+        assert_eq!(
+            members,
+            std::slice::from_ref(&submodule),
+            "a path-synthetic submodule must resolve as a structural member of its \
+             package inside the batched path, not just the point-query fallback"
+        );
+    }
+
     /// Round-trip count for one large Python exact-name batch, the shape
     /// `resolve_relational_frontier` issues once per whole-workspace fan-out
     /// during a usage-graph scan. Reverting `set_exact_definition_values`'s

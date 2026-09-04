@@ -194,10 +194,21 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
     )
 }
 
-/// Batched counterpart to [`path_units`]. `view` must be a wide
-/// `live_definition_*` view whose `path` arm carries the path-synthetic
-/// module row for each file; `code_units` has no row for that arm, so unlike
-/// [`batched_content_sql`] this never joins it.
+/// Batched counterpart to [`path_units`], but reads `workspace_path_symbol_*`
+/// -- the lean, `path_symbol_units`-only views, one row per file -- instead
+/// of a wide `live_definition_*` compound view. `path_units` reads the wide
+/// view because it already has one open for the request's other candidates
+/// and is filtering a single row's worth of work; a batched query has no
+/// such view open already, and joining the wide view here would make SQLite
+/// materialize its content and anchored arms too before this query's own
+/// `path_symbol_units`-only predicate ever runs. `query_view_candidates`'s
+/// doc comment above measured exactly that compound-view materialization
+/// tax at 89.4 minutes on a 802K-row `code_units` table elsewhere in this
+/// codebase; the lean views avoid it by construction, since they never
+/// reference `code_units` at all. Every stored `path` row has an empty
+/// `prefix` (see the `live_definition_exact_names` view), so
+/// `join_predicate` must gate on `requests.prefix = ''` itself -- the lean
+/// views carry no `prefix` column to encode that literal.
 fn batched_path_units_sql(
     view: &str,
     request_columns: &str,
@@ -209,10 +220,9 @@ fn batched_path_units_sql(
              SELECT CAST(key AS INTEGER), {request_values}
              FROM json_each(?1)
          )
-         SELECT requests.request_index, names.rel_path
+         SELECT requests.request_index, symbols.rel_path
          FROM requests
-         CROSS JOIN {view} AS names ON names.lang = ?2
-          AND names.source_kind = 'path'
+         CROSS JOIN {view} AS symbols ON symbols.lang = ?2
           AND {join_predicate}"
     )
 }
@@ -512,15 +522,15 @@ fn set_exact_definition_values<A: LanguageAdapter>(
     )?;
     // Path-derived rows are not covered by the stable/anchored split views
     // above (see `split_view_sources`), so a path-synthetic module answer is
-    // fetched from the wide view separately, same as `definition_values`'s
-    // `path_units` call for the point-query path.
+    // fetched separately, same as `definition_values`'s `path_units` call for
+    // the point-query path.
     let path_sql = batched_path_units_sql(
-        "live_definition_exact_names",
+        "workspace_path_symbol_exact_names",
         "prefix, parent_tail, identifier",
         "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
-        "names.prefix = requests.prefix
-             AND names.exact_parent_tail = requests.parent_tail
-             AND names.identifier = requests.identifier",
+        "requests.prefix = ''
+             AND symbols.package_name = requests.parent_tail
+             AND symbols.short_name = requests.identifier",
     );
     let path_candidates = query_batched_path_units(
         tx,
@@ -628,13 +638,13 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    // Same path-derived gap as `set_exact_definition_values`: the wide view's
-    // `path` arm carries a path-synthetic module's normalized name too.
+    // Same path-derived gap as `set_exact_definition_values`: a
+    // path-synthetic module has a normalized name too.
     let path_sql = batched_path_units_sql(
-        "live_definition_normalized_names",
+        "workspace_path_symbol_normalized_names",
         "prefix, tail",
         "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
-        "names.prefix = requests.prefix AND names.tail = requests.tail",
+        "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
     );
     let path_candidates = query_batched_path_units(
         tx,
@@ -727,12 +737,36 @@ fn set_structural_member_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for (request_index, rows) in indices.into_iter().zip(candidates) {
-        values[request_index] = RelationalDefinitionValue::Definitions(hydrate_candidates(
-            adapter,
-            project_root,
-            rows,
-        )?);
+    // A path-synthetic module is a legitimate structural member of its
+    // containing package (`AnalyzerDefinitionLookup::members` queries a
+    // package's own relational name as a StructuralMembers owner), so this
+    // needs the same path-arm merge as the two set-query functions above, not
+    // just the content-candidate split views.
+    let path_sql = batched_path_units_sql(
+        "workspace_path_symbol_exact_names",
+        "prefix, parent_tail, identifier",
+        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
+        "requests.prefix = ''
+             AND symbols.package_name = requests.parent_tail
+             AND symbols.short_name = requests.identifier",
+    );
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for ((request_index, rows), path_units) in
+        indices.into_iter().zip(candidates).zip(path_candidates)
+    {
+        let mut units = hydrate_candidates(adapter, project_root, rows)?;
+        units.extend(path_units);
+        sort_units(&mut units);
+        units.dedup();
+        values[request_index] = RelationalDefinitionValue::Definitions(units);
         handled[request_index] = true;
     }
     Ok(())
@@ -1635,7 +1669,7 @@ mod tests {
 
     use super::{
         AnalyzerStore, PACKAGE_EXISTS_SQL, batched_content_sql, batched_definition_order_sql,
-        content_sql, render_name, scanned_content_sql, split_view_sources,
+        batched_path_units_sql, content_sql, render_name, scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -2005,6 +2039,69 @@ mod tests {
             )
             .is_none(),
             "PackageTypesInPackage has no split-view equivalent and must stay on the wide-view fallback"
+        );
+    }
+
+    /// Regression pin for issue #20: `set_exact_definition_values`,
+    /// `set_normalized_definition_values`, and `set_structural_member_values`
+    /// each merge in a path-synthetic module's row via
+    /// [`batched_path_units_sql`]. That query must read the lean
+    /// `workspace_path_symbol_exact_names` / `workspace_path_symbol_normalized_names`
+    /// views (one row per file), never a wide `live_definition_*` compound
+    /// view -- joining the wide view here would make SQLite materialize its
+    /// content and anchored arms too before this query's own predicate ever
+    /// runs, the same compound-view tax `query_view_candidates`'s doc comment
+    /// above measured at 89.4 minutes on a 802K-row `code_units` table
+    /// elsewhere in this codebase. If `batched_path_units_sql`'s callers ever
+    /// point back at a wide view, this plan starts referencing `units` and
+    /// `code_units`/`workspace_file_anchors`, and this test fails.
+    #[test]
+    fn batched_path_units_query_never_touches_code_units_or_anchors() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(params!["[]", "python"], |row| row.get::<_, String>(3))
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_lean = |case_name: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows -- \
+                 those belong to live_definition_exact_names's content and anchored arms, \
+                 which a path-only view has no reason to join: {plan:#?}"
+            );
+        };
+        assert_lean(
+            "exact-name path-units query",
+            &explain(batched_path_units_sql(
+                "workspace_path_symbol_exact_names",
+                "prefix, parent_tail, identifier",
+                "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
+                "requests.prefix = ''
+                     AND symbols.package_name = requests.parent_tail
+                     AND symbols.short_name = requests.identifier",
+            )),
+        );
+        assert_lean(
+            "normalized-name path-units query",
+            &explain(batched_path_units_sql(
+                "workspace_path_symbol_normalized_names",
+                "prefix, tail",
+                "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
+                "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
+            )),
         );
     }
 
