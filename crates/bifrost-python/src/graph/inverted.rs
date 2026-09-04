@@ -218,6 +218,14 @@ impl<'a> PythonEdgeScan<'a> {
     }
 }
 
+fn reference_span(node: Node<'_>) -> (UsageReferenceKind, usize, usize) {
+    (
+        classify_reference_node(node),
+        node.start_byte(),
+        node.end_byte(),
+    )
+}
+
 fn canonical_import_module_fqn(
     graph: &PythonGraphSource<'_>,
     python: &dyn PythonUsageSource,
@@ -385,11 +393,7 @@ impl PyScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        let (kind, start, end) = (
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        let (kind, start, end) = reference_span(node);
         // Bounded mode already knows every valid callee as a local hash set, so
         // `accepts_target` is a cheap in-memory check: no reason to defer it.
         // Rooted mode has no such set; `accepts_target` there falls through to a
@@ -405,10 +409,7 @@ impl PyScan<'_> {
             });
             return;
         }
-        if !self.accepts_target(&callee) {
-            return;
-        }
-        self.edges.record_kind(self.input, callee, kind, start, end);
+        self.record_direct(callee, kind, start, end);
     }
 
     /// Record `direct`, or expand it into `canonical_namespace_candidates` when it
@@ -416,11 +417,7 @@ impl PyScan<'_> {
     /// itself depends on the same existence check `record` defers, so bounded and
     /// rooted mode must each make that choice at the same point `record` does.
     fn record_direct_or_namespace_fallback(&mut self, direct: String, node: Node<'_>) {
-        let (kind, start, end) = (
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        let (kind, start, end) = reference_span(node);
         if self.targets.is_none() {
             self.pending.push(PendingCallee::WithNamespaceFallback {
                 direct,
@@ -430,14 +427,7 @@ impl PyScan<'_> {
             });
             return;
         }
-        if self.accepts_target(&direct) {
-            self.edges.record_kind(self.input, direct, kind, start, end);
-            return;
-        }
-        for resolved in self.canonical_namespace_candidates(&direct).iter() {
-            self.edges
-                .record_kind(self.input, resolved.clone(), kind, start, end);
-        }
+        self.record_namespace_fallback(direct, kind, start, end);
     }
 
     /// Record `direct`, or every fqn in `inherited` that has a definition when
@@ -449,11 +439,7 @@ impl PyScan<'_> {
         inherited: Vec<String>,
         node: Node<'_>,
     ) {
-        let (kind, start, end) = (
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        let (kind, start, end) = reference_span(node);
         if self.targets.is_none() {
             self.pending.push(PendingCallee::WithAncestorFallback {
                 direct,
@@ -464,14 +450,63 @@ impl PyScan<'_> {
             });
             return;
         }
+        self.record_ancestor_fallback(direct, inherited, kind, start, end);
+    }
+
+    /// `record`'s immediate (bounded-mode) decision, also `resolve_pending`'s
+    /// `Direct` resolution once its batch has warmed the cache. One place for
+    /// the accept/reject decision so the two callers cannot drift apart.
+    fn record_direct(
+        &mut self,
+        callee: String,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        if self.accepts_target(&callee) {
+            self.edges.record_kind(self.input, callee, kind, start, end);
+        }
+    }
+
+    /// `record_direct_or_namespace_fallback`'s immediate decision, also
+    /// `resolve_pending`'s `WithNamespaceFallback` resolution.
+    fn record_namespace_fallback(
+        &mut self,
+        direct: String,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
         if self.accepts_target(&direct) {
             self.edges.record_kind(self.input, direct, kind, start, end);
             return;
         }
-        for inherited in inherited {
-            if self.accepts_target(&inherited) {
+        // Each candidate needs its own `accepts_target` check, not just workspace
+        // membership: in bounded mode a namespace candidate can be a real declaration
+        // that simply isn't one of the caller's requested targets.
+        for resolved in self.canonical_namespace_candidates(&direct).iter() {
+            self.record_direct(resolved.clone(), kind, start, end);
+        }
+    }
+
+    /// `record_direct_or_ancestor_fallback`'s immediate decision, also
+    /// `resolve_pending`'s `WithAncestorFallback` resolution.
+    fn record_ancestor_fallback(
+        &mut self,
+        direct: String,
+        inherited: Vec<String>,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        if self.accepts_target(&direct) {
+            self.edges.record_kind(self.input, direct, kind, start, end);
+            return;
+        }
+        for candidate in inherited {
+            if self.accepts_target(&candidate) {
                 self.edges
-                    .record_kind(self.input, inherited, kind, start, end);
+                    .record_kind(self.input, candidate, kind, start, end);
             }
         }
     }
@@ -504,44 +539,20 @@ impl PyScan<'_> {
                     kind,
                     start,
                     end,
-                } => {
-                    if self.accepts_target(&callee) {
-                        self.edges.record_kind(self.input, callee, kind, start, end);
-                    }
-                }
+                } => self.record_direct(callee, kind, start, end),
                 PendingCallee::WithNamespaceFallback {
                     direct,
                     kind,
                     start,
                     end,
-                } => {
-                    if self.accepts_target(&direct) {
-                        self.edges.record_kind(self.input, direct, kind, start, end);
-                    } else {
-                        for resolved in self.canonical_namespace_candidates(&direct).iter() {
-                            self.edges
-                                .record_kind(self.input, resolved.clone(), kind, start, end);
-                        }
-                    }
-                }
+                } => self.record_namespace_fallback(direct, kind, start, end),
                 PendingCallee::WithAncestorFallback {
                     direct,
                     inherited,
                     kind,
                     start,
                     end,
-                } => {
-                    if self.accepts_target(&direct) {
-                        self.edges.record_kind(self.input, direct, kind, start, end);
-                    } else {
-                        for inherited in inherited {
-                            if self.accepts_target(&inherited) {
-                                self.edges
-                                    .record_kind(self.input, inherited, kind, start, end);
-                            }
-                        }
-                    }
-                }
+                } => self.record_ancestor_fallback(direct, inherited, kind, start, end),
             }
         }
     }

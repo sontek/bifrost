@@ -394,7 +394,7 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
 
 #[cfg(test)]
 mod tests {
-    use super::build_rooted_python_usage_edges;
+    use super::{build_cached_python_usage_edges_for_targets, build_rooted_python_usage_edges};
     use crate::analyzer::usages::python_graph::with_python_graph_source;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{CodeUnitIndex, Language, PythonAnalyzer, TestProject};
@@ -541,6 +541,56 @@ mod tests {
                 .any(|(_, callee)| callee.ends_with(".no_such_method")),
             "a call to a method that does not exist anywhere in the hierarchy must record no edge \
              for it, even though the constructor call on the same line legitimately does: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A bounded scan's namespace-fallback candidates must still be filtered by the
+    /// caller's requested `targets`, not just by workspace membership. `facade.helper`
+    /// does not resolve directly (it is a re-export), so it expands through
+    /// `canonical_namespace_candidates` into `real.helper` -- which must only be
+    /// recorded as an edge when the caller actually asked for it.
+    #[test]
+    fn bounded_scan_namespace_fallback_candidates_are_filtered_by_targets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let write = |path: &str, contents: &str| {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("create parent directories");
+            }
+            fs::write(&full, contents).expect("write fixture");
+        };
+        write("real.py", "def helper():\n    return 1\n");
+        write("facade/__init__.py", "from real import helper\n");
+        write("other.py", "def helper():\n    return 2\n");
+        write(
+            "consumer.py",
+            "import facade\n\n\ndef run():\n    return facade.helper()\n",
+        );
+
+        let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+        let nodes: crate::hash::HashSet<String> = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        // Shares `real.helper`/`facade.helper`'s terminal segment ("helper") so
+        // `may_have_target_terminal` still lets the scan reach the fallback branch,
+        // but is a different fqn than either -- the caller never asked for `real.helper`.
+        let targets: crate::hash::HashSet<String> =
+            std::iter::once("other.helper".to_string()).collect();
+
+        let edges = build_cached_python_usage_edges_for_targets(&analyzer, &nodes, &targets)
+            .expect("Python files are present, so a bounded scan must produce a graph");
+
+        assert!(
+            !edges
+                .edges
+                .keys()
+                .any(|(_, callee)| callee == "real.helper"),
+            "a namespace-fallback candidate outside the requested target set must not be \
+             recorded as an edge in bounded mode: {:?}",
             edges.edges.keys().collect::<Vec<_>>()
         );
     }
