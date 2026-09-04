@@ -228,19 +228,24 @@ fn batched_path_units_sql(
     )
 }
 
-/// [`batched_path_units_sql`] for the exact-name-shaped `[prefix, parent,
-/// identifier]` key triple, shared by [`set_exact_definition_values`] and
-/// [`set_structural_member_values`]: a structural-member owner's path-arm
-/// candidate is looked up the same way a top-level exact name is, by
-/// `(package_name, short_name)`.
+/// [`batched_path_units_sql`] shared by [`set_exact_definition_values`] and
+/// [`set_structural_member_values`], matched on `exact_fqn` (index 3 of
+/// their request key array) rather than `(package_name, short_name)`.
+/// `workspace_file_path_symbol_rows` -- what `workspace_path_symbol_exact_names`
+/// ultimately reads -- has no index on `(package_name, short_name)`, only
+/// `idx_workspace_file_path_symbol_rows_exact (exact_fqn, file_version_id)`;
+/// a `(package_name, short_name)` predicate against a whole-workspace,
+/// every-language path-symbol table forces SQLite to build its own ad hoc
+/// covering index over that entire table before it can answer even one
+/// request; still running after 45+ minutes on a real large mixed-language
+/// monorepo before being killed to apply this fix. Matching `exact_fqn`
+/// directly lets SQLite seek the existing index per request instead.
 fn batched_exact_name_path_units_sql() -> String {
     batched_path_units_sql(
         "workspace_path_symbol_exact_names",
-        "prefix, parent_tail, identifier",
-        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
-        "requests.prefix = ''
-             AND symbols.package_name = requests.parent_tail
-             AND symbols.short_name = requests.identifier",
+        "prefix, exact_fqn",
+        "json_extract(value, '$[0]'), json_extract(value, '$[3]')",
+        "requests.prefix = '' AND symbols.exact_fqn = requests.exact_fqn",
     )
 }
 
@@ -499,9 +504,12 @@ fn set_exact_definition_values<A: LanguageAdapter>(
     let keys = indices
         .iter()
         .map(|&index| {
-            let (prefix, _, _) = render_name(adapter, &requests[index].name);
+            let (prefix, tail, _) = render_name(adapter, &requests[index].name);
             let (parent, identifier) = tail_parent_and_identifier(adapter, &requests[index].name);
-            [prefix, parent, identifier]
+            // index 3 (`tail`) is only for `batched_exact_name_path_units_sql`'s
+            // `exact_fqn` match; prefix is always empty for a path-arm row, so
+            // `tail` alone equals the request's full rendered name there.
+            [prefix, parent, identifier, tail]
         })
         .collect::<Vec<_>>();
     let request_json = serialize_set_requests(&keys)?;
@@ -711,7 +719,19 @@ fn set_structural_member_values<A: LanguageAdapter>(
             let RelationalDefinitionQuery::StructuralMembers { identifier } = &request.query else {
                 unreachable!()
             };
-            [prefix, tail, identifier.clone()]
+            // index 3 is the member's own `exact_fqn`, for
+            // `batched_exact_name_path_units_sql`'s index-backed match: a
+            // path-synthetic member's full name is its owner's tail plus its
+            // identifier, joined the same way `tail`'s own segments are.
+            let member_exact_fqn = if tail.is_empty() {
+                identifier.clone()
+            } else {
+                let separator = crate::analyzer::languages::language_support(adapter.language())
+                    .expect("every indexed language has registered support")
+                    .package_separator();
+                format!("{tail}{separator}{identifier}")
+            };
+            [prefix, tail, identifier.clone(), member_exact_fqn]
         })
         .collect::<Vec<_>>();
     let request_json = serialize_set_requests(&keys)?;
@@ -2069,7 +2089,7 @@ mod tests {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect query plan")
         };
-        let assert_lean = |case_name: &str, plan: &[String]| {
+        let assert_lean = |case_name: &str, index: &str, plan: &[String]| {
             assert!(
                 plan.iter().all(|detail| {
                     !detail.contains("code_units")
@@ -2082,13 +2102,22 @@ mod tests {
                  those belong to live_definition_exact_names's content and anchored arms, \
                  which a path-only view has no reason to join: {plan:#?}"
             );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{case_name} must seek {index} -- a (package_name, short_name) or other \
+                 unindexed predicate here forces SQLite to build its own covering index \
+                 over the whole workspace's path-symbol rows before answering even one \
+                 request: {plan:#?}"
+            );
         };
         assert_lean(
             "exact-name path-units query",
+            "idx_workspace_file_path_symbol_rows_exact",
             &explain(batched_exact_name_path_units_sql()),
         );
         assert_lean(
             "normalized-name path-units query",
+            "idx_workspace_file_path_symbol_rows_normalized",
             &explain(batched_path_units_sql(
                 "workspace_path_symbol_normalized_names",
                 "prefix, tail",
