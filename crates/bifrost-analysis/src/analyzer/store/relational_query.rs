@@ -26,7 +26,7 @@ const CANDIDATE_COLUMNS: &str =
      units.fq_segment_count, units.exact_fqn_tail, units.fq_segment_bytes,
      units.normalized_fqn_tail";
 
-const SET_QUERY_MIN_REQUESTS: usize = 64;
+pub(crate) const SET_QUERY_MIN_REQUESTS: usize = 64;
 
 fn content_sql(view: &str, predicate: &str) -> String {
     format!(
@@ -192,6 +192,97 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
           AND units.unit_key = names.unit_key
          WHERE names.lang = ?2 AND names.source_kind <> 'path'"
     )
+}
+
+/// Batched counterpart to [`path_units`], but reads `workspace_path_symbol_*`
+/// -- the lean, `path_symbol_units`-only views, one row per file -- instead
+/// of a wide `live_definition_*` compound view. `path_units` reads the wide
+/// view because it already has one open for the request's other candidates
+/// and is filtering a single row's worth of work; a batched query has no
+/// such view open already, and joining the wide view here would make SQLite
+/// materialize its content and anchored arms too before this query's own
+/// `path_symbol_units`-only predicate ever runs.
+/// `mounted_declaration_scan_seeks_live_workspace_files` in `store/mod.rs`
+/// measured exactly that compound-view materialization tax at 89.4 minutes
+/// on a 802K-row `code_units` table for a different caller of the same wide
+/// view; the lean views avoid it by construction, since they never
+/// reference `code_units` at all. Every stored `path` row has an empty
+/// `prefix` (see the `live_definition_exact_names` view), so
+/// `join_predicate` must gate on `requests.prefix = ''` itself -- the lean
+/// views carry no `prefix` column to encode that literal.
+fn batched_path_units_sql(
+    view: &str,
+    request_columns: &str,
+    request_values: &str,
+    join_predicate: &str,
+) -> String {
+    format!(
+        "WITH requests(request_index, {request_columns}) AS MATERIALIZED (
+             SELECT CAST(key AS INTEGER), {request_values}
+             FROM json_each(?1)
+         )
+         SELECT requests.request_index, symbols.rel_path
+         FROM requests
+         CROSS JOIN {view} AS symbols ON symbols.lang = ?2
+          AND {join_predicate}"
+    )
+}
+
+/// [`batched_path_units_sql`] shared by [`set_exact_definition_values`] and
+/// [`set_structural_member_values`], matched on `exact_fqn` (index 3 of
+/// their request key array) rather than `(package_name, short_name)`.
+/// `workspace_file_path_symbol_rows` -- what `workspace_path_symbol_exact_names`
+/// ultimately reads -- has no index on `(package_name, short_name)`, only
+/// `idx_workspace_file_path_symbol_rows_exact (exact_fqn, file_version_id)`;
+/// a `(package_name, short_name)` predicate against a whole-workspace,
+/// every-language path-symbol table forces SQLite to build its own ad hoc
+/// covering index over that entire table before it can answer even one
+/// request; still running after 45+ minutes on a real large mixed-language
+/// monorepo before being killed to apply this fix. Matching `exact_fqn`
+/// directly lets SQLite seek the existing index per request instead.
+fn batched_exact_name_path_units_sql() -> String {
+    batched_path_units_sql(
+        "workspace_path_symbol_exact_names",
+        "prefix, exact_fqn",
+        "json_extract(value, '$[0]'), json_extract(value, '$[3]')",
+        "requests.prefix = '' AND symbols.exact_fqn = requests.exact_fqn",
+    )
+}
+
+/// Path-synthetic module units for a batch of requests, one `Vec` per
+/// request in request-index order. A no-op for adapters that do not
+/// synthesize module units from file paths, matching [`path_units`].
+fn query_batched_path_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    sql: &str,
+    request_json: &str,
+    storage_languages: &[String],
+    request_count: usize,
+) -> Result<Vec<Vec<CodeUnit>>> {
+    let mut units = vec![Vec::new(); request_count];
+    if !adapter.has_path_synthetic_module_units() {
+        return Ok(units);
+    }
+    for lang in storage_languages {
+        let mut statement = tx.prepare_cached(sql)?;
+        let rows = statement
+            .query_map(params![request_json, lang], |row| {
+                Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (request_index, rel_path) in rows {
+            assert!(request_index < units.len());
+            if let Some(unit) = adapter
+                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
+            {
+                units[request_index].push(unit);
+            }
+        }
+    }
+    Ok(units)
 }
 
 fn batched_definition_order_sql(view: &str) -> String {
@@ -365,14 +456,7 @@ fn live_unit_counts(
         .collect()
 }
 
-fn set_queries_need_live_unit_counts<A: LanguageAdapter>(
-    adapter: &A,
-    requests: &[RelationalDefinitionRequest],
-) -> bool {
-    if adapter.has_path_synthetic_module_units() {
-        return false;
-    }
-
+fn set_queries_need_live_unit_counts(requests: &[RelationalDefinitionRequest]) -> bool {
     let mut exact = 0usize;
     let mut normalized = 0usize;
     let mut structural_members = 0usize;
@@ -414,15 +498,18 @@ fn set_exact_definition_values<A: LanguageAdapter>(
             matches!(request.query, RelationalDefinitionQuery::ExactName).then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
         .iter()
         .map(|&index| {
-            let (prefix, _, _) = render_name(adapter, &requests[index].name);
+            let (prefix, tail, _) = render_name(adapter, &requests[index].name);
             let (parent, identifier) = tail_parent_and_identifier(adapter, &requests[index].name);
-            [prefix, parent, identifier]
+            // index 3 (`tail`) is only for `batched_exact_name_path_units_sql`'s
+            // `exact_fqn` match; prefix is always empty for a path-arm row, so
+            // `tail` alone equals the request's full rendered name there.
+            [prefix, parent, identifier, tail]
         })
         .collect::<Vec<_>>();
     let request_json = serialize_set_requests(&keys)?;
@@ -453,14 +540,30 @@ fn set_exact_definition_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for ((request_index, request), rows) in indices
+    // Path-derived rows are not covered by the stable/anchored split views
+    // above (see `split_view_sources`), so a path-synthetic module answer is
+    // fetched separately, same as `definition_values`'s `path_units` call for
+    // the point-query path.
+    let path_sql = batched_exact_name_path_units_sql();
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for (((request_index, request), rows), path_units) in indices
         .into_iter()
         .map(|index| (index, &requests[index]))
         .zip(candidates)
+        .zip(path_candidates)
     {
         let full_name = request.name.full_name();
         let mut units = hydrate_candidates(adapter, project_root, rows)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, false));
+        units.extend(path_units);
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -487,7 +590,7 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
             matches!(request.query, RelationalDefinitionQuery::NormalizedName).then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
@@ -548,14 +651,33 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for ((request_index, request), rows) in indices
+    // Same path-derived gap as `set_exact_definition_values`: a
+    // path-synthetic module has a normalized name too.
+    let path_sql = batched_path_units_sql(
+        "workspace_path_symbol_normalized_names",
+        "prefix, tail",
+        "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
+        "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
+    );
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for (((request_index, request), rows), path_units) in indices
         .into_iter()
         .map(|index| (index, &requests[index]))
         .zip(candidates)
+        .zip(path_candidates)
     {
         let full_name = request.name.full_name();
         let mut units = hydrate_candidates(adapter, project_root, rows)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, true));
+        units.extend(path_units);
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -586,7 +708,7 @@ fn set_structural_member_values<A: LanguageAdapter>(
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
@@ -597,7 +719,19 @@ fn set_structural_member_values<A: LanguageAdapter>(
             let RelationalDefinitionQuery::StructuralMembers { identifier } = &request.query else {
                 unreachable!()
             };
-            [prefix, tail, identifier.clone()]
+            // index 3 is the member's own `exact_fqn`, for
+            // `batched_exact_name_path_units_sql`'s index-backed match: a
+            // path-synthetic member's full name is its owner's tail plus its
+            // identifier, joined the same way `tail`'s own segments are.
+            let member_exact_fqn = if tail.is_empty() {
+                identifier.clone()
+            } else {
+                let separator = crate::analyzer::languages::language_support(adapter.language())
+                    .expect("every indexed language has registered support")
+                    .package_separator();
+                format!("{tail}{separator}{identifier}")
+            };
+            [prefix, tail, identifier.clone(), member_exact_fqn]
         })
         .collect::<Vec<_>>();
     let request_json = serialize_set_requests(&keys)?;
@@ -628,15 +762,59 @@ fn set_structural_member_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for (request_index, rows) in indices.into_iter().zip(candidates) {
-        values[request_index] = RelationalDefinitionValue::Definitions(hydrate_candidates(
-            adapter,
-            project_root,
-            rows,
-        )?);
+    // A path-synthetic module is a legitimate structural member of its
+    // containing package (`AnalyzerDefinitionLookup::members` queries a
+    // package's own relational name as a StructuralMembers owner), so this
+    // needs the same path-arm merge as the two set-query functions above, not
+    // just the content-candidate split views.
+    let path_sql = batched_exact_name_path_units_sql();
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for ((request_index, rows), path_units) in
+        indices.into_iter().zip(candidates).zip(path_candidates)
+    {
+        let mut units = hydrate_candidates(adapter, project_root, rows)?;
+        units.extend(path_units);
+        sort_units(&mut units);
+        units.dedup();
+        values[request_index] = RelationalDefinitionValue::Definitions(units);
         handled[request_index] = true;
     }
     Ok(())
+}
+
+fn run_path_units_sql<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    sql: &str,
+    lang: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<CodeUnit>> {
+    let mut statement = tx.prepare_cached(sql)?;
+    let parameters = std::iter::once(&lang as &dyn rusqlite::ToSql).chain(values.iter().copied());
+    let paths = statement
+        .query_map(rusqlite::params_from_iter(parameters), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut units = paths
+        .into_iter()
+        .filter_map(|rel_path| {
+            adapter
+                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut units);
+    units.dedup();
+    Ok(units)
 }
 
 fn path_units<A: LanguageAdapter>(
@@ -657,23 +835,124 @@ fn path_units<A: LanguageAdapter>(
          WHERE names.lang = ?1 AND names.source_kind = 'path' AND {predicate}
          ORDER BY names.rel_path"
     );
-    let mut statement = tx.prepare_cached(&sql)?;
-    let parameters = std::iter::once(&lang as &dyn rusqlite::ToSql).chain(values.iter().copied());
-    let paths = statement
-        .query_map(rusqlite::params_from_iter(parameters), |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut units = paths
-        .into_iter()
-        .filter_map(|rel_path| {
-            adapter
-                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
-        })
+    run_path_units_sql(tx, adapter, project_root, &sql, lang, values)
+}
+
+fn path_arm_lean_units_sql(view: &str, predicate: &str) -> String {
+    format!(
+        "SELECT symbols.rel_path FROM {view} AS symbols WHERE symbols.lang = ?1 AND {predicate}"
+    )
+}
+
+/// A [`path_units`] point query for the shapes that carry a single full
+/// exact/normalized name or a bare identifier, reading the lean
+/// `workspace_path_symbol_*` views (indexed on `exact_fqn` / `normalized_fqn`
+/// / `short_name`) directly instead of the wide `live_definition_*` compound
+/// view `path_units` otherwise falls back to for every shape. `None` for
+/// `StructuralChildren`, `PackageTypes`, and `PackageTypesInPackage`, which
+/// only carry a package name; `workspace_file_path_symbol_rows` has no index
+/// on that, so those still need a real new index, not a smarter predicate,
+/// and keep using [`path_units`] on the wide view.
+#[allow(clippy::too_many_arguments)]
+fn path_arm_lean_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    lang: &str,
+    request_name: &RelationalName,
+    query: &RelationalDefinitionQuery,
+    prefix: &str,
+    tail: &str,
+) -> Option<Result<Vec<CodeUnit>>> {
+    if !adapter.has_path_synthetic_module_units() {
+        return Some(Ok(Vec::new()));
+    }
+    // Every path-arm row has an empty prefix (see
+    // `live_definition_exact_names`'s path arm); an anchored/non-empty
+    // prefix request can never match one for the owner-scoped shapes below.
+    // `Identifier`/`IdentifierPrefix` never constrain by prefix at all (see
+    // `definition_values`'s own predicate for them), so they are unaffected.
+    let (view, predicate, values): (&str, &str, Vec<String>) = match query {
+        RelationalDefinitionQuery::ExactName if prefix.is_empty() => (
+            "workspace_path_symbol_exact_names",
+            "symbols.exact_fqn = ?2",
+            vec![tail.to_string()],
+        ),
+        RelationalDefinitionQuery::NormalizedName if prefix.is_empty() => (
+            "workspace_path_symbol_normalized_names",
+            "symbols.normalized_fqn = ?2",
+            vec![tail.to_string()],
+        ),
+        RelationalDefinitionQuery::StructuralMembers { identifier }
+        | RelationalDefinitionQuery::VisibleMembers { identifier }
+            if prefix.is_empty() =>
+        {
+            // A path-synthetic member's full name is its owner's tail plus
+            // its identifier, joined the same way `tail`'s own segments are.
+            let child = if tail.is_empty() {
+                identifier.clone()
+            } else {
+                let separator = crate::analyzer::languages::language_support(adapter.language())
+                    .expect("every indexed language has registered support")
+                    .package_separator();
+                format!("{tail}{separator}{identifier}")
+            };
+            (
+                "workspace_path_symbol_exact_names",
+                "symbols.exact_fqn = ?2",
+                vec![child],
+            )
+        }
+        RelationalDefinitionQuery::ExactName
+        | RelationalDefinitionQuery::NormalizedName
+        | RelationalDefinitionQuery::StructuralMembers { .. }
+        | RelationalDefinitionQuery::VisibleMembers { .. } => return Some(Ok(Vec::new())),
+        RelationalDefinitionQuery::Identifier { file } => {
+            let (_, identifier) = tail_parent_and_identifier(adapter, request_name);
+            match file {
+                Some(file) => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name = ?3",
+                    vec![crate::path_utils::rel_path_string(file), identifier],
+                ),
+                None => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name = ?2",
+                    vec![identifier],
+                ),
+            }
+        }
+        RelationalDefinitionQuery::IdentifierPrefix { file } => {
+            let (_, identifier) = tail_parent_and_identifier(adapter, request_name);
+            let upper = decorated_identifier_prefix_successor(&identifier);
+            match file {
+                Some(file) => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name >= ?3 AND symbols.short_name < ?4",
+                    vec![crate::path_utils::rel_path_string(file), identifier, upper],
+                ),
+                None => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name >= ?2 AND symbols.short_name < ?3",
+                    vec![identifier, upper],
+                ),
+            }
+        }
+        _ => return None,
+    };
+    let sql = path_arm_lean_units_sql(view, predicate);
+    let values = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
         .collect::<Vec<_>>();
-    sort_units(&mut units);
-    units.dedup();
-    Ok(units)
+    Some(run_path_units_sql(
+        tx,
+        adapter,
+        project_root,
+        &sql,
+        lang,
+        &values,
+    ))
 }
 
 /// Content-derived candidates for one (view, predicate, values) point query,
@@ -894,6 +1173,58 @@ fn split_view_sources<A: LanguageAdapter>(
     }
 }
 
+/// Path-synthetic module candidates for [`definition_values`], tried
+/// through [`path_arm_lean_units`] first and falling back to [`path_units`]
+/// on the wide view only for the shapes it has no lean equivalent for.
+/// Identical between `definition_values`'s split-view and wide-view-fallback
+/// branches, since a path-arm answer never comes from either's content
+/// candidates.
+#[allow(clippy::too_many_arguments)]
+fn definition_values_path_arm_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    storage_languages: &[String],
+    request: &RelationalDefinitionRequest,
+    prefix: &str,
+    tail: &str,
+    view: &str,
+    predicate: &str,
+    owned_values: &[String],
+) -> Result<Vec<CodeUnit>> {
+    let mut units = Vec::new();
+    for lang in storage_languages {
+        match path_arm_lean_units(
+            tx,
+            adapter,
+            project_root,
+            lang,
+            &request.name,
+            &request.query,
+            prefix,
+            tail,
+        ) {
+            Some(result) => units.extend(result?),
+            None => {
+                let values = owned_values
+                    .iter()
+                    .map(|value| value as &dyn rusqlite::ToSql)
+                    .collect::<Vec<_>>();
+                units.extend(path_units(
+                    tx,
+                    adapter,
+                    project_root,
+                    view,
+                    lang,
+                    predicate,
+                    &values,
+                )?);
+            }
+        }
+    }
+    Ok(units)
+}
+
 fn definition_values<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     adapter: &A,
@@ -992,24 +1323,20 @@ fn definition_values<A: LanguageAdapter>(
                 )?);
             }
             // Path-derived rows are not covered by any split view (see
-            // `split_view_sources`), so `path_units` still queries the
-            // original wide view. It is a no-op unless the adapter opts
-            // into path-synthetic module units.
-            let values = owned_values
-                .iter()
-                .map(|value| value as &dyn rusqlite::ToSql)
-                .collect::<Vec<_>>();
-            for lang in storage_languages {
-                units.extend(path_units(
-                    tx,
-                    adapter,
-                    project_root,
-                    view,
-                    lang,
-                    predicate,
-                    &values,
-                )?);
-            }
+            // `split_view_sources`); a path-synthetic module answer is
+            // fetched separately below.
+            units.extend(definition_values_path_arm_units(
+                tx,
+                adapter,
+                project_root,
+                storage_languages,
+                request,
+                &prefix,
+                &tail,
+                view,
+                predicate,
+                &owned_values,
+            )?);
         }
         None => {
             units.extend(query_view_candidates(
@@ -1021,21 +1348,18 @@ fn definition_values<A: LanguageAdapter>(
                 predicate,
                 &owned_values,
             )?);
-            let values = owned_values
-                .iter()
-                .map(|value| value as &dyn rusqlite::ToSql)
-                .collect::<Vec<_>>();
-            for lang in storage_languages {
-                units.extend(path_units(
-                    tx,
-                    adapter,
-                    project_root,
-                    view,
-                    lang,
-                    predicate,
-                    &values,
-                )?);
-            }
+            units.extend(definition_values_path_arm_units(
+                tx,
+                adapter,
+                project_root,
+                storage_languages,
+                request,
+                &prefix,
+                &tail,
+                view,
+                predicate,
+                &owned_values,
+            )?);
         }
     }
 
@@ -1297,7 +1621,7 @@ impl AnalyzerStore {
             .map(|request| RelationalDefinitionValue::empty_for(&request.query))
             .collect::<Vec<_>>();
         let mut handled = vec![false; requests.len()];
-        let live_unit_counts = if set_queries_need_live_unit_counts(adapter, requests) {
+        let live_unit_counts = if set_queries_need_live_unit_counts(requests) {
             #[cfg(test)]
             self.relational_live_unit_count_queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1351,6 +1675,9 @@ impl AnalyzerStore {
             if cancellation.is_cancelled() {
                 return Ok(RelationalStoreOutcome::Cancelled);
             }
+            #[cfg(test)]
+            self.relational_definition_point_queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let value = match request.query {
                 RelationalDefinitionQuery::PackageRelation(relation) => {
                     RelationalDefinitionValue::PackageRelation(package_relation_value(
@@ -1519,6 +1846,12 @@ impl AnalyzerStore {
         self.relational_live_unit_count_queries
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn relational_definition_point_queries_for_test(&self) -> usize {
+        self.relational_definition_point_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -1527,7 +1860,8 @@ mod tests {
 
     use super::{
         AnalyzerStore, PACKAGE_EXISTS_SQL, batched_content_sql, batched_definition_order_sql,
-        content_sql, render_name, scanned_content_sql, split_view_sources,
+        batched_exact_name_path_units_sql, batched_path_units_sql, content_sql,
+        path_arm_lean_units_sql, render_name, scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -1897,6 +2231,208 @@ mod tests {
             )
             .is_none(),
             "PackageTypesInPackage has no split-view equivalent and must stay on the wide-view fallback"
+        );
+    }
+
+    /// Regression pin: `set_exact_definition_values`,
+    /// `set_normalized_definition_values`, and `set_structural_member_values`
+    /// each merge in a path-synthetic module's row via
+    /// [`batched_path_units_sql`]. That query must read the lean
+    /// `workspace_path_symbol_exact_names` / `workspace_path_symbol_normalized_names`
+    /// views (one row per file), never a wide `live_definition_*` compound
+    /// view -- joining the wide view here would make SQLite materialize its
+    /// content and anchored arms too before this query's own predicate ever
+    /// runs, the same compound-view tax
+    /// `mounted_declaration_scan_seeks_live_workspace_files` in
+    /// `store/mod.rs` measured at 89.4 minutes on a 802K-row `code_units`
+    /// table for a different caller. If `batched_path_units_sql`'s callers ever
+    /// point back at a wide view, this plan starts referencing `units` and
+    /// `code_units`/`workspace_file_anchors`, and this test fails.
+    #[test]
+    fn batched_path_units_query_never_touches_code_units_or_anchors() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(params!["[]", "python"], |row| row.get::<_, String>(3))
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_lean = |case_name: &str, index: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows -- \
+                 those belong to live_definition_exact_names's content and anchored arms, \
+                 which a path-only view has no reason to join: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{case_name} must seek {index} -- a (package_name, short_name) or other \
+                 unindexed predicate here forces SQLite to build its own covering index \
+                 over the whole workspace's path-symbol rows before answering even one \
+                 request: {plan:#?}"
+            );
+        };
+        assert_lean(
+            "exact-name path-units query",
+            "idx_workspace_file_path_symbol_rows_exact",
+            &explain(batched_exact_name_path_units_sql()),
+        );
+        assert_lean(
+            "normalized-name path-units query",
+            "idx_workspace_file_path_symbol_rows_normalized",
+            &explain(batched_path_units_sql(
+                "workspace_path_symbol_normalized_names",
+                "prefix, tail",
+                "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
+                "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
+            )),
+        );
+    }
+
+    /// Regression pin: `path_arm_lean_units` (the point-query counterpart of
+    /// [`batched_path_units_sql`] for below-`SET_QUERY_MIN_REQUESTS` batches
+    /// and shapes with no set executor) must seek `exact_fqn` /
+    /// `normalized_fqn`, never fall through to `path_units`'s wide-view
+    /// `(package_name, short_name)`-style predicate. Caught live: a real
+    /// Python monorepo stalled inside `path_units` on the wide view for a
+    /// shape this function now serves from the lean view instead.
+    #[test]
+    fn path_arm_lean_units_query_seeks_exact_and_normalized_fqn() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(params!["python", "widget"], |row| row.get::<_, String>(3))
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_seeks = |case_name: &str, index: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{case_name} must seek {index}: {plan:#?}"
+            );
+        };
+        assert_seeks(
+            "exact-name point query",
+            "idx_workspace_file_path_symbol_rows_exact",
+            &explain(path_arm_lean_units_sql(
+                "workspace_path_symbol_exact_names",
+                "symbols.exact_fqn = ?2",
+            )),
+        );
+        assert_seeks(
+            "normalized-name point query",
+            "idx_workspace_file_path_symbol_rows_normalized",
+            &explain(path_arm_lean_units_sql(
+                "workspace_path_symbol_normalized_names",
+                "symbols.normalized_fqn = ?2",
+            )),
+        );
+    }
+
+    /// Regression pin for issue #20's follow-up: `path_arm_lean_units`'s
+    /// `Identifier`/`IdentifierPrefix` arms must seek
+    /// `idx_workspace_file_path_symbol_rows_short_name` (added in migration
+    /// 0037), not scan `workspace_file_path_symbol_rows` end to end. Caught
+    /// live: a real Python monorepo stalled with `Identifier` lookups
+    /// falling through to `path_units`'s wide-view scan on every miss from
+    /// `AnalyzerDefinitionLookup::prefetch_fqn_in_language`'s
+    /// identifier-candidate fallback.
+    #[test]
+    fn path_arm_lean_units_identifier_query_seeks_short_name() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String, bindings: &[&str]| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(rusqlite::params_from_iter(bindings), |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_lean = |case_name: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows: {plan:#?}"
+            );
+        };
+        let assert_seeks = |case_name: &str, plan: &[String]| {
+            assert_lean(case_name, plan);
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("idx_workspace_file_path_symbol_rows_short_name")
+                }),
+                "{case_name} must seek idx_workspace_file_path_symbol_rows_short_name: {plan:#?}"
+            );
+        };
+        assert_seeks(
+            "identifier point query, no file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name = ?2",
+                ),
+                &["python", "widget"],
+            ),
+        );
+        assert_seeks(
+            "identifier point query, with file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name = ?3",
+                ),
+                &["python", "widget.py", "widget"],
+            ),
+        );
+        // The range comparison (`>=`/`<`) is far less selective than
+        // equality, and this is EXPLAIN QUERY PLAN over an empty ephemeral
+        // store with no row-count statistics to weigh that against -- only
+        // pin the safety property here, not a specific access path.
+        assert_lean(
+            "identifier-prefix point query, no file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name >= ?2 AND symbols.short_name < ?3",
+                ),
+                &["python", "widget", "widgea"],
+            ),
         );
     }
 

@@ -14078,6 +14078,377 @@ mod tests {
         );
     }
 
+    /// A below-`SET_QUERY_MIN_REQUESTS` batch (or a shape with no set
+    /// executor at all) still takes `definition_values`'s point-query path,
+    /// which now tries `path_arm_lean_units` before falling back to the wide
+    /// view for a path-synthetic module answer. A single Python exact-name
+    /// point query for a module must still resolve correctly through it.
+    #[test]
+    fn relational_point_query_resolves_path_synthetic_module_via_lean_view() {
+        use crate::analyzer::python::PythonAdapter;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "widget.py")
+            .write("class Widget:\n    pass\n")
+            .expect("write Python fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let module = declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .cloned()
+            .expect("widget.py synthesizes its own path-derived module");
+
+        let request = RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: DefinitionLanguageScope::Language(Language::Python),
+            name: analyzer.relational_name_for_unit(&module),
+            query: RelationalDefinitionQuery::ExactName,
+        };
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&[request], &CancellationToken::new())
+        else {
+            panic!("a single-request batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(definitions) = &results[0].value else {
+            panic!("exact-name query returned the wrong value shape")
+        };
+        assert_eq!(
+            definitions,
+            std::slice::from_ref(&module),
+            "a below-threshold point query must still resolve a path-synthetic module"
+        );
+    }
+
+    /// `Identifier` has no batched set executor at all -- it always takes
+    /// `definition_values`'s point-query path, no matter how many are asked
+    /// about in one Rust-level batch call (`AnalyzerDefinitionLookup`'s
+    /// `prefetch_fqn_in_language` batches its own fallback identifier
+    /// lookups this way). `path_arm_lean_units` must still resolve a
+    /// path-synthetic module by its bare identifier, via the
+    /// `idx_workspace_file_path_symbol_rows_short_name` index added
+    /// alongside it, rather than falling through to `path_units`'s wide
+    /// view for every single one.
+    #[test]
+    fn relational_point_query_resolves_path_synthetic_module_by_identifier() {
+        use crate::analyzer::python::PythonAdapter;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "widget.py")
+            .write("class Widget:\n    pass\n")
+            .expect("write Python fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let module = declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .cloned()
+            .expect("widget.py synthesizes its own path-derived module");
+
+        let request = RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: DefinitionLanguageScope::Language(Language::Python),
+            name: RelationalName::stable(
+                brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                    Language::Python,
+                    "widget",
+                    crate::analyzer::fq_name::segment_interner(),
+                ),
+            ),
+            query: RelationalDefinitionQuery::Identifier { file: None },
+        };
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&[request], &CancellationToken::new())
+        else {
+            panic!("a single-request batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(definitions) = &results[0].value else {
+            panic!("identifier query returned the wrong value shape")
+        };
+        assert!(
+            definitions.contains(&module),
+            "an identifier point query must still resolve a path-synthetic module: {definitions:#?}"
+        );
+    }
+
+    /// Python's `has_path_synthetic_module_units() == true` must not force a
+    /// large exact-name batch onto the one-request-at-a-time point-query path
+    /// the way it currently does. A large batch should share one set query the
+    /// same way Java's does above, and a path-synthetic module name in that
+    /// batch must still resolve correctly through it.
+    #[test]
+    fn relational_batch_set_queries_handle_path_synthetic_module_units() {
+        use crate::analyzer::python::PythonAdapter;
+        use crate::analyzer::store::SET_QUERY_MIN_REQUESTS;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "widget.py");
+        file.write("class Widget:\n    def run(self):\n        pass\n")
+            .expect("write Python fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let widget = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.identifier() == "Widget")
+            .cloned()
+            .expect("fixture declares Widget");
+        let module = declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .cloned()
+            .expect("a root-level file synthesizes its own path-derived module");
+        assert_eq!(
+            module.fq_name(),
+            "widget",
+            "widget.py synthesizes the module fqn this test's fixture assumes"
+        );
+
+        let scope = DefinitionLanguageScope::Language(Language::Python);
+        // Below SET_QUERY_MIN_REQUESTS, the point-query path is the correct,
+        // intended choice regardless of path-synthetic modules.
+        let mut requests = Vec::new();
+        for index in 0..SET_QUERY_MIN_REQUESTS {
+            let name = match index {
+                0 => analyzer.relational_name_for_unit(&widget),
+                1 => analyzer.relational_name_for_unit(&module),
+                _ => RelationalName::stable(
+                    brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                        Language::Python,
+                        &format!("missing_exact_{index}"),
+                        crate::analyzer::fq_name::segment_interner(),
+                    ),
+                ),
+            };
+            requests.push(RelationalDefinitionRequest {
+                ordinal: requests.len(),
+                language_scope: scope.clone(),
+                name,
+                query: RelationalDefinitionQuery::ExactName,
+            });
+        }
+
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&requests, &CancellationToken::new())
+        else {
+            panic!("set-shaped relational batch should complete")
+        };
+        assert_eq!(results.len(), requests.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result.ordinal, index);
+            let RelationalDefinitionValue::Definitions(definitions) = &result.value else {
+                panic!("set query returned the wrong value shape")
+            };
+            match index {
+                0 => assert_eq!(definitions, std::slice::from_ref(&widget)),
+                1 => assert_eq!(
+                    definitions,
+                    std::slice::from_ref(&module),
+                    "a path-synthetic module name must still resolve inside the batched path"
+                ),
+                _ => assert!(definitions.is_empty(), "unexpected definitions at {index}"),
+            }
+        }
+        assert_eq!(
+            analyzer
+                .store_context
+                .store
+                .relational_definition_point_queries_for_test(),
+            0,
+            "a full-size exact-name batch must share one set query even when the \
+             adapter has path-synthetic module units, not fall through to a \
+             point query per request"
+        );
+    }
+
+    /// A path-synthetic module is a legitimate structural member of its
+    /// containing package: `AnalyzerDefinitionLookup::members` queries a
+    /// package's own relational name as a `StructuralMembers` owner to find
+    /// its submodules. `set_structural_member_values` must still find one
+    /// once a batch reaches `SET_QUERY_MIN_REQUESTS`, the same way
+    /// `set_exact_definition_values` and `set_normalized_definition_values`
+    /// do for direct exact/normalized-name lookups.
+    #[test]
+    fn relational_batch_set_queries_find_path_synthetic_submodule_as_structural_member() {
+        use crate::analyzer::languages::package_fq_name;
+        use crate::analyzer::python::PythonAdapter;
+        use crate::analyzer::store::SET_QUERY_MIN_REQUESTS;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "pkg/__init__.py")
+            .write("")
+            .expect("write package init");
+        ProjectFile::new(root.clone(), "pkg/sub.py")
+            .write("value = 1\n")
+            .expect("write submodule fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let submodule = declarations
+            .iter()
+            .find(|unit| unit.is_module() && unit.fq_name() == "pkg.sub")
+            .cloned()
+            .expect("pkg/sub.py synthesizes a pkg.sub module");
+
+        let scope = DefinitionLanguageScope::Language(Language::Python);
+        let owner = RelationalName::stable(package_fq_name(Language::Python, "pkg"));
+        // Pad the batch to SET_QUERY_MIN_REQUESTS so the real lookup shares
+        // one set query instead of taking the (already-correct) point-query
+        // path.
+        let mut requests = Vec::new();
+        for index in 0..SET_QUERY_MIN_REQUESTS {
+            let (name, identifier) = if index == 0 {
+                (owner.clone(), "sub".to_string())
+            } else {
+                (
+                    RelationalName::stable(
+                        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                            Language::Python,
+                            &format!("missing_pkg_{index}"),
+                            crate::analyzer::fq_name::segment_interner(),
+                        ),
+                    ),
+                    "missing_member".to_string(),
+                )
+            };
+            requests.push(RelationalDefinitionRequest {
+                ordinal: requests.len(),
+                language_scope: scope.clone(),
+                name,
+                query: RelationalDefinitionQuery::StructuralMembers { identifier },
+            });
+        }
+
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&requests, &CancellationToken::new())
+        else {
+            panic!("set-shaped relational batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(members) = &results[0].value else {
+            panic!("structural-members query returned the wrong value shape")
+        };
+        assert_eq!(
+            members,
+            std::slice::from_ref(&submodule),
+            "a path-synthetic submodule must resolve as a structural member of its \
+             package inside the batched path, not just the point-query fallback"
+        );
+    }
+
+    /// Round-trip count for one large Python exact-name batch, the shape
+    /// `resolve_relational_frontier` issues once per whole-workspace fan-out
+    /// during a usage-graph scan. Reverting `set_exact_definition_values`'s
+    /// and `set_normalized_definition_values`'s path-synthetic-module
+    /// handling (re-adding `|| adapter.has_path_synthetic_module_units()` to
+    /// their bail check) turns `point queries` below from 0 back into
+    /// `FILE_COUNT`, one blocking SQLite round trip per request instead of a
+    /// shared batched query.
+    ///
+    /// That gap does not show up as a wall-clock win on this fixture: SQLite
+    /// against a small, page-cache-resident temp file answers a point query
+    /// in low single-digit microseconds, so `FILE_COUNT` of them here can
+    /// come in faster than the one batched query's CTE materialization and
+    /// join overhead. The regression this fixes is disk- and
+    /// concurrency-bound, not CPU-bound: a live 30-second `sample` against a
+    /// real large Python repository caught
+    /// one thread pinned inside this exact point-query call chain for the
+    /// full sample window while every other worker thread sat idle, on a
+    /// database far too large to stay resident in page cache and under
+    /// contention from the same read-connection pool every other worker was
+    /// waiting on. Round-trip count is what a small fixture can prove
+    /// deterministically and fast; it is also the mechanism the production
+    /// profile actually caught.
+    #[test]
+    fn relational_batch_python_exact_name_batch_round_trips() {
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+        };
+
+        const FILE_COUNT: usize = 2000;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let mut classes = Vec::with_capacity(FILE_COUNT);
+        for index in 0..FILE_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("module_{index}.py"));
+            file.write(format!(
+                "class Widget{index}:\n    def run(self):\n        pass\n"
+            ))
+            .expect("write Python fixture");
+            classes.push(format!("Widget{index}"));
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, crate::analyzer::python::PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let scope = DefinitionLanguageScope::Language(Language::Python);
+        let requests = classes
+            .iter()
+            .enumerate()
+            .map(|(ordinal, name)| {
+                let unit = declarations
+                    .iter()
+                    .find(|unit| unit.is_class() && unit.identifier() == name)
+                    .expect("fixture declares this class");
+                RelationalDefinitionRequest {
+                    ordinal,
+                    language_scope: scope.clone(),
+                    name: analyzer.relational_name_for_unit(unit),
+                    query: RelationalDefinitionQuery::ExactName,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&requests, &CancellationToken::new())
+        else {
+            panic!("set-shaped relational batch should complete")
+        };
+        let elapsed = started.elapsed();
+        for result in &results {
+            let RelationalDefinitionValue::Definitions(definitions) = &result.value else {
+                panic!("set query returned the wrong value shape")
+            };
+            assert_eq!(definitions.len(), 1, "every class in the batch resolves");
+        }
+        eprintln!("exact-name batch of {FILE_COUNT} Python classes: {elapsed:?}");
+        assert_eq!(
+            analyzer
+                .store_context
+                .store
+                .relational_definition_point_queries_for_test(),
+            0,
+            "a {FILE_COUNT}-request exact-name batch must resolve through the shared \
+             batched query, not {FILE_COUNT} individual point queries"
+        );
+    }
+
     #[test]
     fn relational_batch_executes_every_supported_view_shape() {
         use brokk_bifrost_core::analyzer::{
