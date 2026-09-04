@@ -845,20 +845,21 @@ fn path_arm_lean_units_sql(view: &str, predicate: &str) -> String {
 }
 
 /// A [`path_units`] point query for the shapes that carry a single full
-/// exact/normalized name, reading the lean `workspace_path_symbol_*` views
-/// (indexed on `exact_fqn`/`normalized_fqn`) directly instead of the wide
-/// `live_definition_*` compound view `path_units` otherwise falls back to
-/// for every shape. `None` for shapes with no full name to match --
-/// `StructuralChildren`, `Identifier`, `IdentifierPrefix`, `PackageTypes`,
-/// and `PackageTypesInPackage` only carry a bare identifier or a package
-/// name, and `workspace_file_path_symbol_rows` has no index on either;
-/// those still need a real new index (a migration), not a smarter
-/// predicate, and keep using [`path_units`] on the wide view.
+/// exact/normalized name or a bare identifier, reading the lean
+/// `workspace_path_symbol_*` views (indexed on `exact_fqn` / `normalized_fqn`
+/// / `short_name`) directly instead of the wide `live_definition_*` compound
+/// view `path_units` otherwise falls back to for every shape. `None` for
+/// `StructuralChildren`, `PackageTypes`, and `PackageTypesInPackage`, which
+/// only carry a package name; `workspace_file_path_symbol_rows` has no index
+/// on that, so those still need a real new index, not a smarter predicate,
+/// and keep using [`path_units`] on the wide view.
+#[allow(clippy::too_many_arguments)]
 fn path_arm_lean_units<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     adapter: &A,
     project_root: &Path,
     lang: &str,
+    request_name: &RelationalName,
     query: &RelationalDefinitionQuery,
     prefix: &str,
     tail: &str,
@@ -866,25 +867,26 @@ fn path_arm_lean_units<A: LanguageAdapter>(
     if !adapter.has_path_synthetic_module_units() {
         return Some(Ok(Vec::new()));
     }
-    if !prefix.is_empty() {
-        // Every path-arm row has an empty prefix (see
-        // `live_definition_exact_names`'s path arm); an anchored/non-empty
-        // prefix request can never match one.
-        return Some(Ok(Vec::new()));
-    }
-    let (view, predicate, value): (&str, &str, String) = match query {
-        RelationalDefinitionQuery::ExactName => (
+    // Every path-arm row has an empty prefix (see
+    // `live_definition_exact_names`'s path arm); an anchored/non-empty
+    // prefix request can never match one for the owner-scoped shapes below.
+    // `Identifier`/`IdentifierPrefix` never constrain by prefix at all (see
+    // `definition_values`'s own predicate for them), so they are unaffected.
+    let (view, predicate, values): (&str, &str, Vec<String>) = match query {
+        RelationalDefinitionQuery::ExactName if prefix.is_empty() => (
             "workspace_path_symbol_exact_names",
             "symbols.exact_fqn = ?2",
-            tail.to_string(),
+            vec![tail.to_string()],
         ),
-        RelationalDefinitionQuery::NormalizedName => (
+        RelationalDefinitionQuery::NormalizedName if prefix.is_empty() => (
             "workspace_path_symbol_normalized_names",
             "symbols.normalized_fqn = ?2",
-            tail.to_string(),
+            vec![tail.to_string()],
         ),
         RelationalDefinitionQuery::StructuralMembers { identifier }
-        | RelationalDefinitionQuery::VisibleMembers { identifier } => {
+        | RelationalDefinitionQuery::VisibleMembers { identifier }
+            if prefix.is_empty() =>
+        {
             // A path-synthetic member's full name is its owner's tail plus
             // its identifier, joined the same way `tail`'s own segments are.
             let child = if tail.is_empty() {
@@ -898,13 +900,51 @@ fn path_arm_lean_units<A: LanguageAdapter>(
             (
                 "workspace_path_symbol_exact_names",
                 "symbols.exact_fqn = ?2",
-                child,
+                vec![child],
             )
+        }
+        RelationalDefinitionQuery::ExactName
+        | RelationalDefinitionQuery::NormalizedName
+        | RelationalDefinitionQuery::StructuralMembers { .. }
+        | RelationalDefinitionQuery::VisibleMembers { .. } => return Some(Ok(Vec::new())),
+        RelationalDefinitionQuery::Identifier { file } => {
+            let (_, identifier) = tail_parent_and_identifier(adapter, request_name);
+            match file {
+                Some(file) => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name = ?3",
+                    vec![crate::path_utils::rel_path_string(file), identifier],
+                ),
+                None => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name = ?2",
+                    vec![identifier],
+                ),
+            }
+        }
+        RelationalDefinitionQuery::IdentifierPrefix { file } => {
+            let (_, identifier) = tail_parent_and_identifier(adapter, request_name);
+            let upper = decorated_identifier_prefix_successor(&identifier);
+            match file {
+                Some(file) => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name >= ?3 AND symbols.short_name < ?4",
+                    vec![crate::path_utils::rel_path_string(file), identifier, upper],
+                ),
+                None => (
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name >= ?2 AND symbols.short_name < ?3",
+                    vec![identifier, upper],
+                ),
+            }
         }
         _ => return None,
     };
     let sql = path_arm_lean_units_sql(view, predicate);
-    let values: [&dyn rusqlite::ToSql; 1] = [&value];
+    let values = values
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect::<Vec<_>>();
     Some(run_path_units_sql(
         tx,
         adapter,
@@ -1159,6 +1199,7 @@ fn definition_values_path_arm_units<A: LanguageAdapter>(
             adapter,
             project_root,
             lang,
+            &request.name,
             &request.query,
             prefix,
             tail,
@@ -2311,6 +2352,87 @@ mod tests {
                 "workspace_path_symbol_normalized_names",
                 "symbols.normalized_fqn = ?2",
             )),
+        );
+    }
+
+    /// Regression pin for issue #20's follow-up: `path_arm_lean_units`'s
+    /// `Identifier`/`IdentifierPrefix` arms must seek
+    /// `idx_workspace_file_path_symbol_rows_short_name` (added in migration
+    /// 0037), not scan `workspace_file_path_symbol_rows` end to end. Caught
+    /// live: a real Python monorepo stalled with `Identifier` lookups
+    /// falling through to `path_units`'s wide-view scan on every miss from
+    /// `AnalyzerDefinitionLookup::prefetch_fqn_in_language`'s
+    /// identifier-candidate fallback.
+    #[test]
+    fn path_arm_lean_units_identifier_query_seeks_short_name() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String, bindings: &[&str]| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(rusqlite::params_from_iter(bindings), |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_lean = |case_name: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows: {plan:#?}"
+            );
+        };
+        let assert_seeks = |case_name: &str, plan: &[String]| {
+            assert_lean(case_name, plan);
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains("idx_workspace_file_path_symbol_rows_short_name")
+                }),
+                "{case_name} must seek idx_workspace_file_path_symbol_rows_short_name: {plan:#?}"
+            );
+        };
+        assert_seeks(
+            "identifier point query, no file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name = ?2",
+                ),
+                &["python", "widget"],
+            ),
+        );
+        assert_seeks(
+            "identifier point query, with file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.rel_path = ?2 AND symbols.short_name = ?3",
+                ),
+                &["python", "widget.py", "widget"],
+            ),
+        );
+        // The range comparison (`>=`/`<`) is far less selective than
+        // equality, and this is EXPLAIN QUERY PLAN over an empty ephemeral
+        // store with no row-count statistics to weigh that against -- only
+        // pin the safety property here, not a specific access path.
+        assert_lean(
+            "identifier-prefix point query, no file",
+            &explain(
+                path_arm_lean_units_sql(
+                    "workspace_path_symbol_exact_names",
+                    "symbols.short_name >= ?2 AND symbols.short_name < ?3",
+                ),
+                &["python", "widget", "widgea"],
+            ),
         );
     }
 

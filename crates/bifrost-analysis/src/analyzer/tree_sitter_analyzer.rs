@@ -14126,6 +14126,64 @@ mod tests {
         );
     }
 
+    /// `Identifier` has no batched set executor at all -- it always takes
+    /// `definition_values`'s point-query path, no matter how many are asked
+    /// about in one Rust-level batch call (`AnalyzerDefinitionLookup`'s
+    /// `prefetch_fqn_in_language` batches its own fallback identifier
+    /// lookups this way). `path_arm_lean_units` must still resolve a
+    /// path-synthetic module by its bare identifier, via the
+    /// `idx_workspace_file_path_symbol_rows_short_name` index added
+    /// alongside it, rather than falling through to `path_units`'s wide
+    /// view for every single one.
+    #[test]
+    fn relational_point_query_resolves_path_synthetic_module_by_identifier() {
+        use crate::analyzer::python::PythonAdapter;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+            RelationalName,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "widget.py")
+            .write("class Widget:\n    pass\n")
+            .expect("write Python fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let module = declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .cloned()
+            .expect("widget.py synthesizes its own path-derived module");
+
+        let request = RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: DefinitionLanguageScope::Language(Language::Python),
+            name: RelationalName::stable(
+                brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                    Language::Python,
+                    "widget",
+                    crate::analyzer::fq_name::segment_interner(),
+                ),
+            ),
+            query: RelationalDefinitionQuery::Identifier { file: None },
+        };
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&[request], &CancellationToken::new())
+        else {
+            panic!("a single-request batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(definitions) = &results[0].value else {
+            panic!("identifier query returned the wrong value shape")
+        };
+        assert!(
+            definitions.contains(&module),
+            "an identifier point query must still resolve a path-synthetic module: {definitions:#?}"
+        );
+    }
+
     /// Python's `has_path_synthetic_module_units() == true` must not force a
     /// large exact-name batch onto the one-request-at-a-time point-query path
     /// the way it currently does. A large batch should share one set query the
