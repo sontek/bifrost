@@ -26,7 +26,7 @@ const CANDIDATE_COLUMNS: &str =
      units.fq_segment_count, units.exact_fqn_tail, units.fq_segment_bytes,
      units.normalized_fqn_tail";
 
-const SET_QUERY_MIN_REQUESTS: usize = 64;
+pub(crate) const SET_QUERY_MIN_REQUESTS: usize = 64;
 
 fn content_sql(view: &str, predicate: &str) -> String {
     format!(
@@ -227,6 +227,22 @@ fn batched_path_units_sql(
     )
 }
 
+/// [`batched_path_units_sql`] for the exact-name-shaped `[prefix, parent,
+/// identifier]` key triple, shared by [`set_exact_definition_values`] and
+/// [`set_structural_member_values`]: a structural-member owner's path-arm
+/// candidate is looked up the same way a top-level exact name is, by
+/// `(package_name, short_name)`.
+fn batched_exact_name_path_units_sql() -> String {
+    batched_path_units_sql(
+        "workspace_path_symbol_exact_names",
+        "prefix, parent_tail, identifier",
+        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
+        "requests.prefix = ''
+             AND symbols.package_name = requests.parent_tail
+             AND symbols.short_name = requests.identifier",
+    )
+}
+
 /// Path-synthetic module units for a batch of requests, one `Vec` per
 /// request in request-index order. A no-op for adapters that do not
 /// synthesize module units from file paths, matching [`path_units`].
@@ -239,9 +255,7 @@ fn query_batched_path_units<A: LanguageAdapter>(
     storage_languages: &[String],
     request_count: usize,
 ) -> Result<Vec<Vec<CodeUnit>>> {
-    let mut units = std::iter::repeat_with(Vec::new)
-        .take(request_count)
-        .collect::<Vec<_>>();
+    let mut units = vec![Vec::new(); request_count];
     if !adapter.has_path_synthetic_module_units() {
         return Ok(units);
     }
@@ -436,10 +450,7 @@ fn live_unit_counts(
         .collect()
 }
 
-fn set_queries_need_live_unit_counts<A: LanguageAdapter>(
-    _adapter: &A,
-    requests: &[RelationalDefinitionRequest],
-) -> bool {
+fn set_queries_need_live_unit_counts(requests: &[RelationalDefinitionRequest]) -> bool {
     let mut exact = 0usize;
     let mut normalized = 0usize;
     let mut structural_members = 0usize;
@@ -524,14 +535,7 @@ fn set_exact_definition_values<A: LanguageAdapter>(
     // above (see `split_view_sources`), so a path-synthetic module answer is
     // fetched separately, same as `definition_values`'s `path_units` call for
     // the point-query path.
-    let path_sql = batched_path_units_sql(
-        "workspace_path_symbol_exact_names",
-        "prefix, parent_tail, identifier",
-        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
-        "requests.prefix = ''
-             AND symbols.package_name = requests.parent_tail
-             AND symbols.short_name = requests.identifier",
-    );
+    let path_sql = batched_exact_name_path_units_sql();
     let path_candidates = query_batched_path_units(
         tx,
         adapter,
@@ -742,14 +746,7 @@ fn set_structural_member_values<A: LanguageAdapter>(
     // package's own relational name as a StructuralMembers owner), so this
     // needs the same path-arm merge as the two set-query functions above, not
     // just the content-candidate split views.
-    let path_sql = batched_path_units_sql(
-        "workspace_path_symbol_exact_names",
-        "prefix, parent_tail, identifier",
-        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
-        "requests.prefix = ''
-             AND symbols.package_name = requests.parent_tail
-             AND symbols.short_name = requests.identifier",
-    );
+    let path_sql = batched_exact_name_path_units_sql();
     let path_candidates = query_batched_path_units(
         tx,
         adapter,
@@ -1430,7 +1427,7 @@ impl AnalyzerStore {
             .map(|request| RelationalDefinitionValue::empty_for(&request.query))
             .collect::<Vec<_>>();
         let mut handled = vec![false; requests.len()];
-        let live_unit_counts = if set_queries_need_live_unit_counts(adapter, requests) {
+        let live_unit_counts = if set_queries_need_live_unit_counts(requests) {
             #[cfg(test)]
             self.relational_live_unit_count_queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1669,7 +1666,8 @@ mod tests {
 
     use super::{
         AnalyzerStore, PACKAGE_EXISTS_SQL, batched_content_sql, batched_definition_order_sql,
-        batched_path_units_sql, content_sql, render_name, scanned_content_sql, split_view_sources,
+        batched_exact_name_path_units_sql, batched_path_units_sql, content_sql, render_name,
+        scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -2085,14 +2083,7 @@ mod tests {
         };
         assert_lean(
             "exact-name path-units query",
-            &explain(batched_path_units_sql(
-                "workspace_path_symbol_exact_names",
-                "prefix, parent_tail, identifier",
-                "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
-                "requests.prefix = ''
-                     AND symbols.package_name = requests.parent_tail
-                     AND symbols.short_name = requests.identifier",
-            )),
+            &explain(batched_exact_name_path_units_sql()),
         );
         assert_lean(
             "normalized-name path-units query",

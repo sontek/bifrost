@@ -6,6 +6,8 @@ pub mod query;
 mod relational_query;
 pub(crate) mod writer;
 pub(crate) use relational_query::RelationalStoreOutcome;
+#[cfg(test)]
+pub(crate) use relational_query::SET_QUERY_MIN_REQUESTS;
 
 use std::borrow::Cow;
 use std::cell::RefCell;

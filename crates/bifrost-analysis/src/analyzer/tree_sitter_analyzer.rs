@@ -14086,6 +14086,7 @@ mod tests {
     #[test]
     fn relational_batch_set_queries_handle_path_synthetic_module_units() {
         use crate::analyzer::python::PythonAdapter;
+        use crate::analyzer::store::SET_QUERY_MIN_REQUESTS;
         use brokk_bifrost_core::analyzer::{
             DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
             RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
@@ -14117,10 +14118,10 @@ mod tests {
         );
 
         let scope = DefinitionLanguageScope::Language(Language::Python);
-        // SET_QUERY_MIN_REQUESTS: below this, the point-query path is the
-        // correct, intended choice regardless of path-synthetic modules.
+        // Below SET_QUERY_MIN_REQUESTS, the point-query path is the correct,
+        // intended choice regardless of path-synthetic modules.
         let mut requests = Vec::new();
-        for index in 0..64usize {
+        for index in 0..SET_QUERY_MIN_REQUESTS {
             let name = match index {
                 0 => analyzer.relational_name_for_unit(&widget),
                 1 => analyzer.relational_name_for_unit(&module),
@@ -14184,6 +14185,7 @@ mod tests {
     fn relational_batch_set_queries_find_path_synthetic_submodule_as_structural_member() {
         use crate::analyzer::languages::package_fq_name;
         use crate::analyzer::python::PythonAdapter;
+        use crate::analyzer::store::SET_QUERY_MIN_REQUESTS;
         use brokk_bifrost_core::analyzer::{
             DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
             RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
@@ -14209,10 +14211,11 @@ mod tests {
 
         let scope = DefinitionLanguageScope::Language(Language::Python);
         let owner = RelationalName::stable(package_fq_name(Language::Python, "pkg"));
-        // SET_QUERY_MIN_REQUESTS: pad the batch so the real lookup shares one
-        // set query instead of taking the (already-correct) point-query path.
+        // Pad the batch to SET_QUERY_MIN_REQUESTS so the real lookup shares
+        // one set query instead of taking the (already-correct) point-query
+        // path.
         let mut requests = Vec::new();
-        for index in 0..64usize {
+        for index in 0..SET_QUERY_MIN_REQUESTS {
             let (name, identifier) = if index == 0 {
                 (owner.clone(), "sub".to_string())
             } else {
