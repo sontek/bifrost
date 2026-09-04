@@ -475,6 +475,10 @@ pub struct AnalyzerStore {
     relational_batch_distinct_requests: AtomicUsize,
     #[cfg(test)]
     relational_live_unit_count_queries: AtomicUsize,
+    /// Point-query fallbacks inside `relational_definition_values`'s per-request
+    /// loop, i.e. requests none of the three `set_*` batched functions handled.
+    #[cfg(test)]
+    relational_definition_point_queries: AtomicUsize,
 }
 
 /// A hand-rolled checkout pool of read-only SQLite connections for one store.
@@ -2129,6 +2133,8 @@ impl AnalyzerStore {
             relational_batch_distinct_requests: AtomicUsize::new(0),
             #[cfg(test)]
             relational_live_unit_count_queries: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_definition_point_queries: AtomicUsize::new(0),
         }
     }
 
@@ -2163,6 +2169,8 @@ impl AnalyzerStore {
             relational_batch_distinct_requests: AtomicUsize::new(0),
             #[cfg(test)]
             relational_live_unit_count_queries: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_definition_point_queries: AtomicUsize::new(0),
         })
     }
 

@@ -194,6 +194,67 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
     )
 }
 
+/// Batched counterpart to [`path_units`]. `view` must be a wide
+/// `live_definition_*` view whose `path` arm carries the path-synthetic
+/// module row for each file; `code_units` has no row for that arm, so unlike
+/// [`batched_content_sql`] this never joins it.
+fn batched_path_units_sql(
+    view: &str,
+    request_columns: &str,
+    request_values: &str,
+    join_predicate: &str,
+) -> String {
+    format!(
+        "WITH requests(request_index, {request_columns}) AS MATERIALIZED (
+             SELECT CAST(key AS INTEGER), {request_values}
+             FROM json_each(?1)
+         )
+         SELECT requests.request_index, names.rel_path
+         FROM requests
+         CROSS JOIN {view} AS names ON names.lang = ?2
+          AND names.source_kind = 'path'
+          AND {join_predicate}"
+    )
+}
+
+/// Path-synthetic module units for a batch of requests, one `Vec` per
+/// request in request-index order. A no-op for adapters that do not
+/// synthesize module units from file paths, matching [`path_units`].
+fn query_batched_path_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    sql: &str,
+    request_json: &str,
+    storage_languages: &[String],
+    request_count: usize,
+) -> Result<Vec<Vec<CodeUnit>>> {
+    let mut units = std::iter::repeat_with(Vec::new)
+        .take(request_count)
+        .collect::<Vec<_>>();
+    if !adapter.has_path_synthetic_module_units() {
+        return Ok(units);
+    }
+    for lang in storage_languages {
+        let mut statement = tx.prepare_cached(sql)?;
+        let rows = statement
+            .query_map(params![request_json, lang], |row| {
+                Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (request_index, rel_path) in rows {
+            assert!(request_index < units.len());
+            if let Some(unit) = adapter
+                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
+            {
+                units[request_index].push(unit);
+            }
+        }
+    }
+    Ok(units)
+}
+
 fn batched_definition_order_sql(view: &str) -> String {
     format!(
         "WITH requests(request_index, prefix, parent_tail, identifier) AS MATERIALIZED (
@@ -366,13 +427,9 @@ fn live_unit_counts(
 }
 
 fn set_queries_need_live_unit_counts<A: LanguageAdapter>(
-    adapter: &A,
+    _adapter: &A,
     requests: &[RelationalDefinitionRequest],
 ) -> bool {
-    if adapter.has_path_synthetic_module_units() {
-        return false;
-    }
-
     let mut exact = 0usize;
     let mut normalized = 0usize;
     let mut structural_members = 0usize;
@@ -414,7 +471,7 @@ fn set_exact_definition_values<A: LanguageAdapter>(
             matches!(request.query, RelationalDefinitionQuery::ExactName).then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
@@ -453,14 +510,37 @@ fn set_exact_definition_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for ((request_index, request), rows) in indices
+    // Path-derived rows are not covered by the stable/anchored split views
+    // above (see `split_view_sources`), so a path-synthetic module answer is
+    // fetched from the wide view separately, same as `definition_values`'s
+    // `path_units` call for the point-query path.
+    let path_sql = batched_path_units_sql(
+        "live_definition_exact_names",
+        "prefix, parent_tail, identifier",
+        "json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')",
+        "names.prefix = requests.prefix
+             AND names.exact_parent_tail = requests.parent_tail
+             AND names.identifier = requests.identifier",
+    );
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for (((request_index, request), rows), path_units) in indices
         .into_iter()
         .map(|index| (index, &requests[index]))
         .zip(candidates)
+        .zip(path_candidates)
     {
         let full_name = request.name.full_name();
         let mut units = hydrate_candidates(adapter, project_root, rows)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, false));
+        units.extend(path_units);
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -487,7 +567,7 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
             matches!(request.query, RelationalDefinitionQuery::NormalizedName).then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
@@ -548,14 +628,33 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
         live_unit_counts,
         indices.len(),
     )?;
-    for ((request_index, request), rows) in indices
+    // Same path-derived gap as `set_exact_definition_values`: the wide view's
+    // `path` arm carries a path-synthetic module's normalized name too.
+    let path_sql = batched_path_units_sql(
+        "live_definition_normalized_names",
+        "prefix, tail",
+        "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
+        "names.prefix = requests.prefix AND names.tail = requests.tail",
+    );
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for (((request_index, request), rows), path_units) in indices
         .into_iter()
         .map(|index| (index, &requests[index]))
         .zip(candidates)
+        .zip(path_candidates)
     {
         let full_name = request.name.full_name();
         let mut units = hydrate_candidates(adapter, project_root, rows)?;
         units.retain(|unit| unit_matches_requested_name(adapter, unit, &full_name, true));
+        units.extend(path_units);
         sort_units(&mut units);
         units.dedup();
         values[request_index] = RelationalDefinitionValue::Definitions(units);
@@ -586,7 +685,7 @@ fn set_structural_member_values<A: LanguageAdapter>(
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    if indices.len() < SET_QUERY_MIN_REQUESTS || adapter.has_path_synthetic_module_units() {
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
         return Ok(());
     }
     let keys = indices
@@ -1351,6 +1450,9 @@ impl AnalyzerStore {
             if cancellation.is_cancelled() {
                 return Ok(RelationalStoreOutcome::Cancelled);
             }
+            #[cfg(test)]
+            self.relational_definition_point_queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let value = match request.query {
                 RelationalDefinitionQuery::PackageRelation(relation) => {
                     RelationalDefinitionValue::PackageRelation(package_relation_value(
@@ -1517,6 +1619,12 @@ impl AnalyzerStore {
     #[cfg(test)]
     pub(crate) fn relational_live_unit_count_queries_for_test(&self) -> usize {
         self.relational_live_unit_count_queries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn relational_definition_point_queries_for_test(&self) -> usize {
+        self.relational_definition_point_queries
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
