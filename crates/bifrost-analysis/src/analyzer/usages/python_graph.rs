@@ -76,6 +76,12 @@ pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
 /// Trees are parsed on demand inside the per-file walk and dropped when the
 /// closure returns, so live trees are bounded by the worker count rather than
 /// the workspace size (#200).
+///
+/// The relational frontier opens once for the whole fan-out, not once per file:
+/// [`resolve_relational_frontier`](crate::analyzer::relational_frontier::resolve_relational_frontier)
+/// is called around `build_edge_output`, the same placement `with_java_graph_source`
+/// uses, so a question one file's scan raises can be answered in the same batch as
+/// every other file's, instead of paying its own round trip per file.
 fn build_python_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
@@ -93,39 +99,37 @@ where
         PythonEdgeScan::new(domain.callers(), targets)
     });
     let scope = AnalyzerQueryScope::new(analyzer);
-    build_edge_output(&files, keep_file, |file| {
-        parse_and_collect_with_domain(
-            analyzer,
-            file,
-            domain,
-            ParseSpec::whole(&language),
-            |input| {
-                let cancellation = crate::CancellationToken::new();
-                match crate::analyzer::relational_frontier::resolve_relational_frontier(
+    let cancellation = crate::CancellationToken::new();
+    match crate::analyzer::relational_frontier::resolve_relational_frontier(
+        analyzer,
+        &cancellation,
+        |frontier| {
+            let graph = PythonGraphSource {
+                token: scope.token(),
+                index: analyzer,
+                hierarchy: analyzer.type_hierarchy_provider(),
+                imports: analyzer.import_analysis_provider(),
+                definitions: frontier,
+            };
+            build_edge_output(&files, &keep_file, |file| {
+                parse_and_collect_with_domain(
                     analyzer,
-                    &cancellation,
-                    |frontier| {
-                        let graph = PythonGraphSource {
-                            token: scope.token(),
-                            index: analyzer,
-                            hierarchy: analyzer.type_hierarchy_provider(),
-                            imports: analyzer.import_analysis_provider(),
-                            definitions: frontier,
-                        };
-                        scan.scan_file(&graph, py, file, input)
-                    },
-                ) {
-                    crate::analyzer::RelationalFrontierOutcome::Complete(edges) => edges,
-                    crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-                        unreachable!("an uncancelled Python edge frontier cannot cancel")
-                    }
-                    crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-                        panic!("Python relational edge frontier failed: {error:?}")
-                    }
-                }
-            },
-        )
-    })
+                    file,
+                    domain,
+                    ParseSpec::whole(&language),
+                    |input| scan.scan_file(&graph, py, file, input),
+                )
+            })
+        },
+    ) {
+        crate::analyzer::RelationalFrontierOutcome::Complete(edges) => edges,
+        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+            unreachable!("an uncancelled Python edge frontier cannot cancel")
+        }
+        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            panic!("Python relational edge frontier failed: {error:?}")
+        }
+    }
 }
 
 pub(crate) fn build_rooted_python_usage_edges<F>(
@@ -390,6 +394,7 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
 
 #[cfg(test)]
 mod tests {
+    use super::build_rooted_python_usage_edges;
     use crate::analyzer::usages::python_graph::with_python_graph_source;
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{CodeUnitIndex, Language, PythonAnalyzer, TestProject};
@@ -460,6 +465,83 @@ mod tests {
         assert_eq!(
             counts.reparsed, 0,
             "return-type extraction must reuse the analyzer's prepared syntax rather than reparsing the file per class member: {counts:?}"
+        );
+    }
+
+    /// The rooted (whole-workspace, no fixed target set) scan defers every
+    /// existence check to `PyScan::resolve_pending` and answers them from one
+    /// `prefetch_definitions` batch. This exercises all three deferred
+    /// shapes end to end -- a plain call, a namespace-imported module call, and
+    /// an inherited-member call that only resolves through the ancestor
+    /// fallback -- plus a negative case, proving the deferral changed only
+    /// when each check runs, not what it decides.
+    #[test]
+    fn rooted_scan_resolves_direct_namespace_and_inherited_callees() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let write = |path: &str, contents: &str| {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("create parent directories");
+            }
+            fs::write(&full, contents).expect("write fixture");
+        };
+        write(
+            "base.py",
+            "class Base:\n    def greet(self):\n        return \"hi\"\n",
+        );
+        write(
+            "derived.py",
+            "from base import Base\n\n\nclass Derived(Base):\n    pass\n",
+        );
+        write("pkgmod.py", "def helper():\n    return 1\n");
+        write(
+            "consumer.py",
+            "import pkgmod\nfrom derived import Derived\n\n\ndef plain():\n    return helper_local()\n\n\ndef helper_local():\n    return 0\n\n\ndef via_namespace():\n    return pkgmod.helper()\n\n\ndef via_inheritance():\n    return Derived().greet()\n\n\ndef via_missing():\n    return Derived().no_such_method()\n",
+        );
+
+        let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+        let callers: crate::hash::HashSet<String> = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+
+        let edges = build_rooted_python_usage_edges(&analyzer, &callers, |_| true)
+            .expect("Python files are present, so a rooted scan must produce a graph");
+
+        assert!(
+            edges.edges.contains_key(&(
+                "consumer.plain".to_string(),
+                "consumer.helper_local".to_string()
+            )),
+            "a plain same-file call must resolve via the deferred Direct path: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            edges.edges.contains_key(&(
+                "consumer.via_namespace".to_string(),
+                "pkgmod.helper".to_string()
+            )),
+            "a namespace-imported module call must resolve via the deferred namespace-fallback path: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            edges.edges.contains_key(&(
+                "consumer.via_inheritance".to_string(),
+                "base.Base.greet".to_string()
+            )),
+            "a call to an inherited method must resolve via the deferred ancestor-fallback path: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !edges
+                .edges
+                .keys()
+                .any(|(_, callee)| callee.ends_with(".no_such_method")),
+            "a call to a method that does not exist anywhere in the hierarchy must record no edge \
+             for it, even though the constructor call on the same line legitimately does: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
         );
     }
 }

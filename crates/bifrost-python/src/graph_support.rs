@@ -50,6 +50,13 @@ pub trait PythonSource: CodeUnitIndex + ImportAnalysisProvider {
 
     fn definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
+    /// Warms the cache behind [`CodeUnitIndex::definitions`] for every name in `fq_names`
+    /// with as few store round trips as possible, so a caller resolving many distinct
+    /// names in a loop pays one batched read instead of one per name. A no-op wherever
+    /// the analyzer holds no open query scope to cache into; every caller then falls
+    /// back to `definitions`'s own point lookup with unchanged results.
+    fn prefetch_definitions(&self, fq_names: &[String]);
+
     /// Shared by handle: both products are immutable for the analyzer
     /// generation that cached them, and callers ask for them once per receiver
     /// type, annotation or export name, so deep-cloning the whole map out of

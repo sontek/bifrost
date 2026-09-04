@@ -36,7 +36,7 @@ use crate::usage_index::{
 };
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    FileEdgeScanInput, PerFileEdges, classify_reference_node,
+    FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
@@ -210,8 +210,10 @@ impl<'a> PythonEdgeScan<'a> {
             canonical_namespace_candidates: &self.canonical_namespace_candidates,
             input,
             edges: PerFileEdges::default(),
+            pending: Vec::new(),
         };
         scan_tree(input.root(), &mut ctx);
+        ctx.resolve_pending();
         ctx.edges
     }
 }
@@ -249,6 +251,42 @@ struct PyScan<'a> {
     canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
+    /// Rooted-mode existence checks deferred until [`PyScan::resolve_pending`] runs
+    /// them as one batch instead of one live store round trip per reference. Empty
+    /// and unused in bounded (`targets: Some`) mode, where membership is already a
+    /// local hash check.
+    pending: Vec<PendingCallee>,
+}
+
+/// One reference site's deferred existence check, resolved in [`PyScan::resolve_pending`]
+/// after a single [`PythonSource::prefetch_definitions`] batch has warmed every candidate
+/// name below. Each variant mirrors the immediate-check logic its call site used to run
+/// inline; deferring only changes when the check runs, not what it decides.
+enum PendingCallee {
+    /// Record `callee` if it has a definition.
+    Direct {
+        callee: String,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    },
+    /// Record `direct` if it has a definition; otherwise expand it into every
+    /// workspace candidate `canonical_namespace_candidates` finds.
+    WithNamespaceFallback {
+        direct: String,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    },
+    /// Record `direct` if it has a definition; otherwise record every fqn in
+    /// `inherited` that does.
+    WithAncestorFallback {
+        direct: String,
+        inherited: Vec<String>,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    },
 }
 
 struct NamespaceBinding {
@@ -347,16 +385,165 @@ impl PyScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        if !self.accepts_target(&callee) {
-            return;
-        }
-        self.edges.record_kind(
-            self.input,
-            callee,
+        let (kind, start, end) = (
             classify_reference_node(node),
             node.start_byte(),
             node.end_byte(),
         );
+        // Bounded mode already knows every valid callee as a local hash set, so
+        // `accepts_target` is a cheap in-memory check: no reason to defer it.
+        // Rooted mode has no such set; `accepts_target` there falls through to a
+        // live store lookup, so every rooted-mode reference is deferred and
+        // resolved together in `resolve_pending`, batching what would otherwise be
+        // one round trip per reference.
+        if self.targets.is_none() {
+            self.pending.push(PendingCallee::Direct {
+                callee,
+                kind,
+                start,
+                end,
+            });
+            return;
+        }
+        if !self.accepts_target(&callee) {
+            return;
+        }
+        self.edges.record_kind(self.input, callee, kind, start, end);
+    }
+
+    /// Record `direct`, or expand it into `canonical_namespace_candidates` when it
+    /// has no definition. Splits out from `record` because the choice of fallback
+    /// itself depends on the same existence check `record` defers, so bounded and
+    /// rooted mode must each make that choice at the same point `record` does.
+    fn record_direct_or_namespace_fallback(&mut self, direct: String, node: Node<'_>) {
+        let (kind, start, end) = (
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        if self.targets.is_none() {
+            self.pending.push(PendingCallee::WithNamespaceFallback {
+                direct,
+                kind,
+                start,
+                end,
+            });
+            return;
+        }
+        if self.accepts_target(&direct) {
+            self.edges.record_kind(self.input, direct, kind, start, end);
+            return;
+        }
+        for resolved in self.canonical_namespace_candidates(&direct).iter() {
+            self.edges
+                .record_kind(self.input, resolved.clone(), kind, start, end);
+        }
+    }
+
+    /// Record `direct`, or every fqn in `inherited` that has a definition when
+    /// `direct` does not. `inherited` is resolved eagerly (a local type-hierarchy
+    /// walk, not a store round trip) so only the existence checks are deferred.
+    fn record_direct_or_ancestor_fallback(
+        &mut self,
+        direct: String,
+        inherited: Vec<String>,
+        node: Node<'_>,
+    ) {
+        let (kind, start, end) = (
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        if self.targets.is_none() {
+            self.pending.push(PendingCallee::WithAncestorFallback {
+                direct,
+                inherited,
+                kind,
+                start,
+                end,
+            });
+            return;
+        }
+        if self.accepts_target(&direct) {
+            self.edges.record_kind(self.input, direct, kind, start, end);
+            return;
+        }
+        for inherited in inherited {
+            if self.accepts_target(&inherited) {
+                self.edges
+                    .record_kind(self.input, inherited, kind, start, end);
+            }
+        }
+    }
+
+    /// Resolve every rooted-mode reference `record` and its siblings deferred,
+    /// in one batch instead of one live store round trip per reference. A no-op
+    /// in bounded mode, which never defers (see `record`).
+    fn resolve_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut names = Vec::new();
+        for item in &self.pending {
+            match item {
+                PendingCallee::Direct { callee, .. } => names.push(callee.clone()),
+                PendingCallee::WithNamespaceFallback { direct, .. } => names.push(direct.clone()),
+                PendingCallee::WithAncestorFallback {
+                    direct, inherited, ..
+                } => {
+                    names.push(direct.clone());
+                    names.extend(inherited.iter().cloned());
+                }
+            }
+        }
+        self.python.prefetch_definitions(&names);
+        for item in std::mem::take(&mut self.pending) {
+            match item {
+                PendingCallee::Direct {
+                    callee,
+                    kind,
+                    start,
+                    end,
+                } => {
+                    if self.accepts_target(&callee) {
+                        self.edges.record_kind(self.input, callee, kind, start, end);
+                    }
+                }
+                PendingCallee::WithNamespaceFallback {
+                    direct,
+                    kind,
+                    start,
+                    end,
+                } => {
+                    if self.accepts_target(&direct) {
+                        self.edges.record_kind(self.input, direct, kind, start, end);
+                    } else {
+                        for resolved in self.canonical_namespace_candidates(&direct).iter() {
+                            self.edges
+                                .record_kind(self.input, resolved.clone(), kind, start, end);
+                        }
+                    }
+                }
+                PendingCallee::WithAncestorFallback {
+                    direct,
+                    inherited,
+                    kind,
+                    start,
+                    end,
+                } => {
+                    if self.accepts_target(&direct) {
+                        self.edges.record_kind(self.input, direct, kind, start, end);
+                    } else {
+                        for inherited in inherited {
+                            if self.accepts_target(&inherited) {
+                                self.edges
+                                    .record_kind(self.input, inherited, kind, start, end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
@@ -672,29 +859,19 @@ fn handle_attribute(
             })
     {
         let direct = format!("{module}.{attribute_text}");
-        if ctx.accepts_target(&direct) {
-            ctx.record(direct, attribute);
-        } else {
-            for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
-                ctx.record(resolved.clone(), attribute);
-            }
-        }
+        ctx.record_direct_or_namespace_fallback(direct, attribute);
     }
     if object.kind() == "call" && ctx.may_have_target_terminal(attribute_text) {
         for class in call_result_types(ctx.graph, ctx.python, ctx.file, ctx.source, object, facts) {
             let direct = format!("{}.{attribute_text}", class.fq_name());
-            if ctx.accepts_target(&direct) {
-                ctx.record(direct, attribute);
-                continue;
-            }
-            if let Some(provider) = ctx.graph.hierarchy {
-                for ancestor in provider.get_ancestors(&class) {
-                    let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
-                    if ctx.accepts_target(&inherited) {
-                        ctx.record(inherited, attribute);
-                    }
-                }
-            }
+            let inherited = ctx.graph.hierarchy.map_or_else(Vec::new, |provider| {
+                provider
+                    .get_ancestors(&class)
+                    .into_iter()
+                    .map(|ancestor| format!("{}.{attribute_text}", ancestor.fq_name()))
+                    .collect()
+            });
+            ctx.record_direct_or_ancestor_fallback(direct, inherited, attribute);
         }
     }
     // `module.symbol` or a deeper `module.ns.symbol` chain rooted at a
@@ -709,7 +886,7 @@ fn handle_attribute(
             let mut direct = binding.module.clone();
             let workspace_module = binding.workspace_module;
             let consumed_attributes = binding.consumed_attributes;
-            if object.kind() == "identifier" && ctx.accepts_target(&direct) {
+            if object.kind() == "identifier" {
                 ctx.record(direct.clone(), object);
             }
             for member in attributes.into_iter().skip(consumed_attributes) {
@@ -720,19 +897,15 @@ fn handle_attribute(
                 direct.push('.');
                 direct.push_str(member_text);
             }
-            if ctx.accepts_target(&direct) {
-                ctx.record(direct, attribute);
-                return;
-            }
             // A re-export alias can change the terminal name (`proto.module` may
             // canonically resolve to `proto.modules.define_module`), so terminal-name
             // filtering is not sound here. Namespace imports are already a narrow,
             // structured subset of attributes; resolve their workspace candidates
             // and let `record` retain only requested targets.
             if workspace_module {
-                for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
-                    ctx.record(resolved.clone(), attribute);
-                }
+                ctx.record_direct_or_namespace_fallback(direct, attribute);
+            } else {
+                ctx.record(direct, attribute);
             }
             return;
         }
@@ -832,10 +1005,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
     }
     for class in classes {
         for declaration in resolved_member_declarations(ctx.graph, &class, member) {
-            let fqn = declaration.fq_name();
-            if ctx.accepts_target(&fqn) {
-                ctx.record(fqn, name);
-            }
+            ctx.record(declaration.fq_name(), name);
         }
     }
 }

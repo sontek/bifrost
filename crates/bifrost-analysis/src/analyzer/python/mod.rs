@@ -399,6 +399,10 @@ impl PythonSource for PythonAnalyzer {
         self.inner.forward_definition_fqn(fqn)
     }
 
+    fn prefetch_definitions(&self, fq_names: &[String]) {
+        self.inner.prefetch_definitions(fq_names);
+    }
+
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
