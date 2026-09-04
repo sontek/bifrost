@@ -201,10 +201,11 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
 /// and is filtering a single row's worth of work; a batched query has no
 /// such view open already, and joining the wide view here would make SQLite
 /// materialize its content and anchored arms too before this query's own
-/// `path_symbol_units`-only predicate ever runs. `query_view_candidates`'s
-/// doc comment above measured exactly that compound-view materialization
-/// tax at 89.4 minutes on a 802K-row `code_units` table elsewhere in this
-/// codebase; the lean views avoid it by construction, since they never
+/// `path_symbol_units`-only predicate ever runs. Issue #2794
+/// (`mounted_declaration_scan_seeks_live_workspace_files` in `store/mod.rs`)
+/// measured exactly that compound-view materialization tax at 89.4 minutes
+/// on a 802K-row `code_units` table for a different caller of the same wide
+/// view; the lean views avoid it by construction, since they never
 /// reference `code_units` at all. Every stored `path` row has an empty
 /// `prefix` (see the `live_definition_exact_names` view), so
 /// `join_predicate` must gate on `requests.prefix = ''` itself -- the lean
@@ -2048,9 +2049,10 @@ mod tests {
     /// views (one row per file), never a wide `live_definition_*` compound
     /// view -- joining the wide view here would make SQLite materialize its
     /// content and anchored arms too before this query's own predicate ever
-    /// runs, the same compound-view tax `query_view_candidates`'s doc comment
-    /// above measured at 89.4 minutes on a 802K-row `code_units` table
-    /// elsewhere in this codebase. If `batched_path_units_sql`'s callers ever
+    /// runs, the same compound-view tax issue #2794
+    /// (`mounted_declaration_scan_seeks_live_workspace_files` in
+    /// `store/mod.rs`) measured at 89.4 minutes on a 802K-row `code_units`
+    /// table for a different caller. If `batched_path_units_sql`'s callers ever
     /// point back at a wide view, this plan starts referencing `units` and
     /// `code_units`/`workspace_file_anchors`, and this test fails.
     #[test]
