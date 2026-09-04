@@ -14078,6 +14078,54 @@ mod tests {
         );
     }
 
+    /// A below-`SET_QUERY_MIN_REQUESTS` batch (or a shape with no set
+    /// executor at all) still takes `definition_values`'s point-query path,
+    /// which now tries `path_arm_lean_units` before falling back to the wide
+    /// view for a path-synthetic module answer. A single Python exact-name
+    /// point query for a module must still resolve correctly through it.
+    #[test]
+    fn relational_point_query_resolves_path_synthetic_module_via_lean_view() {
+        use crate::analyzer::python::PythonAdapter;
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "widget.py")
+            .write("class Widget:\n    pass\n")
+            .expect("write Python fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let module = declarations
+            .iter()
+            .find(|unit| unit.is_module())
+            .cloned()
+            .expect("widget.py synthesizes its own path-derived module");
+
+        let request = RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: DefinitionLanguageScope::Language(Language::Python),
+            name: analyzer.relational_name_for_unit(&module),
+            query: RelationalDefinitionQuery::ExactName,
+        };
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.batch(&[request], &CancellationToken::new())
+        else {
+            panic!("a single-request batch should complete")
+        };
+        let RelationalDefinitionValue::Definitions(definitions) = &results[0].value else {
+            panic!("exact-name query returned the wrong value shape")
+        };
+        assert_eq!(
+            definitions,
+            std::slice::from_ref(&module),
+            "a below-threshold point query must still resolve a path-synthetic module"
+        );
+    }
+
     /// Python's `has_path_synthetic_module_units() == true` must not force a
     /// large exact-name batch onto the one-request-at-a-time point-query path
     /// the way it currently does. A large batch should share one set query the

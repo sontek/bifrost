@@ -790,6 +790,33 @@ fn set_structural_member_values<A: LanguageAdapter>(
     Ok(())
 }
 
+fn run_path_units_sql<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    sql: &str,
+    lang: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<CodeUnit>> {
+    let mut statement = tx.prepare_cached(sql)?;
+    let parameters = std::iter::once(&lang as &dyn rusqlite::ToSql).chain(values.iter().copied());
+    let paths = statement
+        .query_map(rusqlite::params_from_iter(parameters), |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut units = paths
+        .into_iter()
+        .filter_map(|rel_path| {
+            adapter
+                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut units);
+    units.dedup();
+    Ok(units)
+}
+
 fn path_units<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     adapter: &A,
@@ -808,23 +835,84 @@ fn path_units<A: LanguageAdapter>(
          WHERE names.lang = ?1 AND names.source_kind = 'path' AND {predicate}
          ORDER BY names.rel_path"
     );
-    let mut statement = tx.prepare_cached(&sql)?;
-    let parameters = std::iter::once(&lang as &dyn rusqlite::ToSql).chain(values.iter().copied());
-    let paths = statement
-        .query_map(rusqlite::params_from_iter(parameters), |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut units = paths
-        .into_iter()
-        .filter_map(|rel_path| {
-            adapter
-                .path_synthetic_module_unit(&ProjectFile::new(project_root.to_path_buf(), rel_path))
-        })
-        .collect::<Vec<_>>();
-    sort_units(&mut units);
-    units.dedup();
-    Ok(units)
+    run_path_units_sql(tx, adapter, project_root, &sql, lang, values)
+}
+
+fn path_arm_lean_units_sql(view: &str, predicate: &str) -> String {
+    format!(
+        "SELECT symbols.rel_path FROM {view} AS symbols WHERE symbols.lang = ?1 AND {predicate}"
+    )
+}
+
+/// A [`path_units`] point query for the shapes that carry a single full
+/// exact/normalized name, reading the lean `workspace_path_symbol_*` views
+/// (indexed on `exact_fqn`/`normalized_fqn`) directly instead of the wide
+/// `live_definition_*` compound view `path_units` otherwise falls back to
+/// for every shape. `None` for shapes with no full name to match --
+/// `StructuralChildren`, `Identifier`, `IdentifierPrefix`, `PackageTypes`,
+/// and `PackageTypesInPackage` only carry a bare identifier or a package
+/// name, and `workspace_file_path_symbol_rows` has no index on either;
+/// those still need a real new index (a migration), not a smarter
+/// predicate, and keep using [`path_units`] on the wide view.
+fn path_arm_lean_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    lang: &str,
+    query: &RelationalDefinitionQuery,
+    prefix: &str,
+    tail: &str,
+) -> Option<Result<Vec<CodeUnit>>> {
+    if !adapter.has_path_synthetic_module_units() {
+        return Some(Ok(Vec::new()));
+    }
+    if !prefix.is_empty() {
+        // Every path-arm row has an empty prefix (see
+        // `live_definition_exact_names`'s path arm); an anchored/non-empty
+        // prefix request can never match one.
+        return Some(Ok(Vec::new()));
+    }
+    let (view, predicate, value): (&str, &str, String) = match query {
+        RelationalDefinitionQuery::ExactName => (
+            "workspace_path_symbol_exact_names",
+            "symbols.exact_fqn = ?2",
+            tail.to_string(),
+        ),
+        RelationalDefinitionQuery::NormalizedName => (
+            "workspace_path_symbol_normalized_names",
+            "symbols.normalized_fqn = ?2",
+            tail.to_string(),
+        ),
+        RelationalDefinitionQuery::StructuralMembers { identifier }
+        | RelationalDefinitionQuery::VisibleMembers { identifier } => {
+            // A path-synthetic member's full name is its owner's tail plus
+            // its identifier, joined the same way `tail`'s own segments are.
+            let child = if tail.is_empty() {
+                identifier.clone()
+            } else {
+                let separator = crate::analyzer::languages::language_support(adapter.language())
+                    .expect("every indexed language has registered support")
+                    .package_separator();
+                format!("{tail}{separator}{identifier}")
+            };
+            (
+                "workspace_path_symbol_exact_names",
+                "symbols.exact_fqn = ?2",
+                child,
+            )
+        }
+        _ => return None,
+    };
+    let sql = path_arm_lean_units_sql(view, predicate);
+    let values: [&dyn rusqlite::ToSql; 1] = [&value];
+    Some(run_path_units_sql(
+        tx,
+        adapter,
+        project_root,
+        &sql,
+        lang,
+        &values,
+    ))
 }
 
 /// Content-derived candidates for one (view, predicate, values) point query,
@@ -1045,6 +1133,57 @@ fn split_view_sources<A: LanguageAdapter>(
     }
 }
 
+/// Path-synthetic module candidates for [`definition_values`], tried
+/// through [`path_arm_lean_units`] first and falling back to [`path_units`]
+/// on the wide view only for the shapes it has no lean equivalent for.
+/// Identical between `definition_values`'s split-view and wide-view-fallback
+/// branches, since a path-arm answer never comes from either's content
+/// candidates.
+#[allow(clippy::too_many_arguments)]
+fn definition_values_path_arm_units<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    storage_languages: &[String],
+    request: &RelationalDefinitionRequest,
+    prefix: &str,
+    tail: &str,
+    view: &str,
+    predicate: &str,
+    owned_values: &[String],
+) -> Result<Vec<CodeUnit>> {
+    let mut units = Vec::new();
+    for lang in storage_languages {
+        match path_arm_lean_units(
+            tx,
+            adapter,
+            project_root,
+            lang,
+            &request.query,
+            prefix,
+            tail,
+        ) {
+            Some(result) => units.extend(result?),
+            None => {
+                let values = owned_values
+                    .iter()
+                    .map(|value| value as &dyn rusqlite::ToSql)
+                    .collect::<Vec<_>>();
+                units.extend(path_units(
+                    tx,
+                    adapter,
+                    project_root,
+                    view,
+                    lang,
+                    predicate,
+                    &values,
+                )?);
+            }
+        }
+    }
+    Ok(units)
+}
+
 fn definition_values<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     adapter: &A,
@@ -1143,24 +1282,20 @@ fn definition_values<A: LanguageAdapter>(
                 )?);
             }
             // Path-derived rows are not covered by any split view (see
-            // `split_view_sources`), so `path_units` still queries the
-            // original wide view. It is a no-op unless the adapter opts
-            // into path-synthetic module units.
-            let values = owned_values
-                .iter()
-                .map(|value| value as &dyn rusqlite::ToSql)
-                .collect::<Vec<_>>();
-            for lang in storage_languages {
-                units.extend(path_units(
-                    tx,
-                    adapter,
-                    project_root,
-                    view,
-                    lang,
-                    predicate,
-                    &values,
-                )?);
-            }
+            // `split_view_sources`); a path-synthetic module answer is
+            // fetched separately below.
+            units.extend(definition_values_path_arm_units(
+                tx,
+                adapter,
+                project_root,
+                storage_languages,
+                request,
+                &prefix,
+                &tail,
+                view,
+                predicate,
+                &owned_values,
+            )?);
         }
         None => {
             units.extend(query_view_candidates(
@@ -1172,21 +1307,18 @@ fn definition_values<A: LanguageAdapter>(
                 predicate,
                 &owned_values,
             )?);
-            let values = owned_values
-                .iter()
-                .map(|value| value as &dyn rusqlite::ToSql)
-                .collect::<Vec<_>>();
-            for lang in storage_languages {
-                units.extend(path_units(
-                    tx,
-                    adapter,
-                    project_root,
-                    view,
-                    lang,
-                    predicate,
-                    &values,
-                )?);
-            }
+            units.extend(definition_values_path_arm_units(
+                tx,
+                adapter,
+                project_root,
+                storage_languages,
+                request,
+                &prefix,
+                &tail,
+                view,
+                predicate,
+                &owned_values,
+            )?);
         }
     }
 
@@ -1687,8 +1819,8 @@ mod tests {
 
     use super::{
         AnalyzerStore, PACKAGE_EXISTS_SQL, batched_content_sql, batched_definition_order_sql,
-        batched_exact_name_path_units_sql, batched_path_units_sql, content_sql, render_name,
-        scanned_content_sql, split_view_sources,
+        batched_exact_name_path_units_sql, batched_path_units_sql, content_sql,
+        path_arm_lean_units_sql, render_name, scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -2123,6 +2255,61 @@ mod tests {
                 "prefix, tail",
                 "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
                 "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
+            )),
+        );
+    }
+
+    /// Regression pin: `path_arm_lean_units` (the point-query counterpart of
+    /// [`batched_path_units_sql`] for below-`SET_QUERY_MIN_REQUESTS` batches
+    /// and shapes with no set executor) must seek `exact_fqn` /
+    /// `normalized_fqn`, never fall through to `path_units`'s wide-view
+    /// `(package_name, short_name)`-style predicate. Caught live: a real
+    /// Python monorepo stalled inside `path_units` on the wide view for a
+    /// shape this function now serves from the lean view instead.
+    #[test]
+    fn path_arm_lean_units_query_seeks_exact_and_normalized_fqn() {
+        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+        let connection = store.conn.lock().expect("store mutex");
+        let explain = |sql: String| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare query plan");
+            statement
+                .query_map(params!["python", "widget"], |row| row.get::<_, String>(3))
+                .expect("read query plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect query plan")
+        };
+        let assert_seeks = |case_name: &str, index: &str, plan: &[String]| {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("code_units")
+                        && !detail.contains("live_definition_units")
+                        && !detail.contains("SCAN units")
+                        && !detail.contains("SEARCH units")
+                        && !detail.contains("anchor")
+                }),
+                "{case_name} must never touch code_units or workspace_file_anchor_rows: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{case_name} must seek {index}: {plan:#?}"
+            );
+        };
+        assert_seeks(
+            "exact-name point query",
+            "idx_workspace_file_path_symbol_rows_exact",
+            &explain(path_arm_lean_units_sql(
+                "workspace_path_symbol_exact_names",
+                "symbols.exact_fqn = ?2",
+            )),
+        );
+        assert_seeks(
+            "normalized-name point query",
+            "idx_workspace_file_path_symbol_rows_normalized",
+            &explain(path_arm_lean_units_sql(
+                "workspace_path_symbol_normalized_names",
+                "symbols.normalized_fqn = ?2",
             )),
         );
     }
