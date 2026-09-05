@@ -788,10 +788,18 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
 /// against 187.1 CPU-seconds), nearly all `sys`, from re-reading evicted pages.
 const READER_PAGE_CACHE_KIB: i64 = -8192;
 
-/// Environment override for the pooled readers' `mmap_size`, in bytes. `0`
-/// disables memory-mapped reads and restores the pre-2026-09 behavior.
+/// Environment override for the pooled readers' `mmap_size`, in bytes.
+///
+/// Set it to `0` to turn memory-mapped reads off, which sends every page back
+/// through pcache1 and its shared LRU mutex. That is an escape hatch for a host
+/// where mapping is unwanted -- scarce address space, or a filesystem where a
+/// truncated file would raise `SIGBUS` -- and costs the speedup documented on
+/// `configure_readonly_page_cache`, not a tuning value worth reaching for.
 pub const CACHE_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_MMAP_BYTES";
 /// Environment override for the streaming reader's `mmap_size`, in bytes.
+///
+/// Defaults to `0` (unmapped); see `open_streaming_readonly_connection` for why
+/// that path is left alone.
 pub const CACHE_STREAMING_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_STREAMING_MMAP_BYTES";
 /// Default `mmap_size` for a pooled reader.
 ///
