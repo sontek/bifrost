@@ -14126,7 +14126,7 @@ mod tests {
         );
     }
 
-    /// `Identifier` has no batched set executor at all -- it always takes
+    /// `Identifier` requests below `SET_QUERY_MIN_REQUESTS` take
     /// `definition_values`'s point-query path, no matter how many are asked
     /// about in one Rust-level batch call (`AnalyzerDefinitionLookup`'s
     /// `prefetch_fqn_in_language` batches its own fallback identifier
@@ -14446,6 +14446,107 @@ mod tests {
             0,
             "a {FILE_COUNT}-request exact-name batch must resolve through the shared \
              batched query, not {FILE_COUNT} individual point queries"
+        );
+    }
+
+    #[test]
+    fn relational_batch_identifier_set_query_matches_the_point_query_answer() {
+        use brokk_bifrost_core::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionLookup,
+            RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+        };
+
+        // Above SET_QUERY_MIN_REQUESTS so the whole batch takes the set path;
+        // each request re-issued alone stays below it and takes the point path.
+        const FILE_COUNT: usize = 80;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for index in 0..FILE_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("module_{index}.py"));
+            file.write(format!(
+                "class Widget{index}:\n    def run(self):\n        pass\n"
+            ))
+            .expect("write Python fixture");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, crate::analyzer::python::PythonAdapter);
+        let declarations = analyzer.get_all_declarations();
+        let scope = DefinitionLanguageScope::Language(Language::Python);
+        // Mix classes (content rows) with path-synthetic modules, so the
+        // comparison covers the path arm as well as the content arms.
+        let names = declarations
+            .iter()
+            .filter(|unit| unit.is_class() || unit.is_module())
+            .map(|unit| analyzer.relational_name_for_unit(unit))
+            .collect::<Vec<_>>();
+        assert!(
+            names.len() >= crate::analyzer::store::SET_QUERY_MIN_REQUESTS,
+            "fixture must exceed the set-query threshold, got {}",
+            names.len()
+        );
+        let requests = names
+            .iter()
+            .enumerate()
+            .map(|(ordinal, name)| RelationalDefinitionRequest {
+                ordinal,
+                language_scope: scope.clone(),
+                name: name.clone(),
+                query: RelationalDefinitionQuery::Identifier { file: None },
+            })
+            .collect::<Vec<_>>();
+
+        let RelationalBatchOutcome::Complete(batched) =
+            analyzer.batch(&requests, &CancellationToken::new())
+        else {
+            panic!("set-shaped relational batch should complete")
+        };
+        // Read before the singles below, which drive this counter up by design.
+        assert_eq!(
+            analyzer
+                .store_context
+                .store
+                .relational_definition_point_queries_for_test(),
+            0,
+            "a batch above SET_QUERY_MIN_REQUESTS must resolve bare identifiers through \
+             the shared batched query, not one point query per request"
+        );
+
+        let mut resolved = 0usize;
+        for (request, batched_result) in requests.iter().zip(&batched) {
+            let single = vec![RelationalDefinitionRequest {
+                ordinal: 0,
+                ..request.clone()
+            }];
+            let RelationalBatchOutcome::Complete(point) =
+                analyzer.batch(&single, &CancellationToken::new())
+            else {
+                panic!("single-request relational batch should complete")
+            };
+            let (
+                RelationalDefinitionValue::Definitions(from_set),
+                RelationalDefinitionValue::Definitions(from_point),
+            ) = (&batched_result.value, &point[0].value)
+            else {
+                panic!("identifier lookups return definitions")
+            };
+            assert_eq!(
+                from_set
+                    .iter()
+                    .map(|unit| unit.fq_name())
+                    .collect::<Vec<_>>(),
+                from_point
+                    .iter()
+                    .map(|unit| unit.fq_name())
+                    .collect::<Vec<_>>(),
+                "batched and point-query answers must agree for {:?}",
+                request.name.full_name()
+            );
+            resolved += from_set.len();
+        }
+        assert!(
+            resolved > 0,
+            "the comparison is vacuous unless some request actually resolves"
         );
     }
 

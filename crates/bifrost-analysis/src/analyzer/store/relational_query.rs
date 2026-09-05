@@ -249,6 +249,21 @@ fn batched_exact_name_path_units_sql() -> String {
     )
 }
 
+/// The path arm for a batch of bare-identifier requests.
+///
+/// `Identifier` carries only a short name, so this seeks `short_name`
+/// rather than `exact_fqn` -- the same column [`path_arm_lean_units`]
+/// uses for the single-request form, and the reason that column is
+/// indexed.
+fn batched_identifier_path_units_sql() -> String {
+    batched_path_units_sql(
+        "workspace_path_symbol_exact_names",
+        "short_name",
+        "json_extract(value, '$[0]')",
+        "symbols.short_name = requests.short_name",
+    )
+}
+
 /// Path-synthetic module units for a batch of requests, one `Vec` per
 /// request in request-index order. A no-op for adapters that do not
 /// synthesize module units from file paths, matching [`path_units`].
@@ -460,11 +475,18 @@ fn set_queries_need_live_unit_counts(requests: &[RelationalDefinitionRequest]) -
     let mut exact = 0usize;
     let mut normalized = 0usize;
     let mut structural_members = 0usize;
+    let mut identifiers = 0usize;
     for request in requests {
         let count = match request.query {
             RelationalDefinitionQuery::ExactName => &mut exact,
             RelationalDefinitionQuery::NormalizedName => &mut normalized,
             RelationalDefinitionQuery::StructuralMembers { .. } => &mut structural_members,
+            // Must stay in step with `set_identifier_definition_values`'s own
+            // filter: without a cardinality read the seek/scan choice in
+            // `query_batched_content_candidates` degrades to a full per-language
+            // walk of `code_units`, and an identifier-only batch (what the
+            // identifier-candidate fallback issues) has nothing else to trigger it.
+            RelationalDefinitionQuery::Identifier { file: None } => &mut identifiers,
             _ => continue,
         };
         *count += 1;
@@ -680,6 +702,111 @@ fn set_normalized_definition_values<A: LanguageAdapter>(
         units.extend(path_units);
         sort_units(&mut units);
         units.dedup();
+        values[request_index] = RelationalDefinitionValue::Definitions(units);
+        handled[request_index] = true;
+    }
+    Ok(())
+}
+
+/// Batched counterpart to [`definition_values`] for bare-identifier lookups.
+///
+/// `Identifier` had no set executor, so every such request fell through to
+/// the per-request loop no matter how large the batch. That is the dominant
+/// shape a whole-workspace Python usage graph issues: its identifier-candidate
+/// fallback assembles every unresolved name into one call, and each one then
+/// cost a round trip. Measured on a ~30k-file workspace, bare identifiers were
+/// 1,366,705 of the 1,750,000 point queries a single `usage_graph` call issued
+/// before it was cut short -- 78%, against 20% for exact names and under 2%
+/// for every other shape combined.
+///
+/// Only the unscoped (`file: None`) form is batched here. That is the form the
+/// bulk fallback issues; the file-scoped form needs a second key column and has
+/// never been observed hot, so it stays on the point-query path.
+///
+/// Unlike its exact/normalized siblings this applies no post-hydration name
+/// filter, matching [`definition_values`], which deliberately leaves the
+/// `Identifier` arm empty: a bare identifier is not expected to match the
+/// requested full name.
+#[allow(clippy::too_many_arguments)]
+fn set_identifier_definition_values<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    adapter: &A,
+    project_root: &Path,
+    storage_languages: &[String],
+    live_unit_counts: &HashMap<String, usize>,
+    requests: &[RelationalDefinitionRequest],
+    values: &mut [RelationalDefinitionValue],
+    handled: &mut [bool],
+) -> Result<()> {
+    let indices = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            matches!(
+                request.query,
+                RelationalDefinitionQuery::Identifier { file: None }
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if indices.len() < SET_QUERY_MIN_REQUESTS {
+        return Ok(());
+    }
+    let keys = indices
+        .iter()
+        .map(|&index| {
+            let (_, identifier) = tail_parent_and_identifier(adapter, &requests[index].name);
+            [identifier]
+        })
+        .collect::<Vec<_>>();
+    let request_json = serialize_set_requests(&keys)?;
+    let queries = [
+        "live_stable_definition_identifiers",
+        "live_anchored_definition_identifiers",
+    ]
+    .map(|view| BatchedContentQuery {
+        seek_sql: batched_content_sql(
+            view,
+            "identifier",
+            "json_extract(value, '$[0]')",
+            "names.identifier = requests.identifier",
+        ),
+        scan_sql: scanned_content_sql(view, "json_extract(value, '$[0]')", "names.identifier"),
+    });
+    let candidates = query_batched_content_candidates(
+        tx,
+        &queries,
+        &request_json,
+        storage_languages,
+        live_unit_counts,
+        indices.len(),
+    )?;
+    // Path-derived rows are not covered by the stable/anchored split views
+    // above (see `split_view_sources`), so the path-synthetic answer is
+    // fetched separately, same as the point-query path's
+    // `definition_values_path_arm_units` call.
+    let path_sql = batched_identifier_path_units_sql();
+    let path_candidates = query_batched_path_units(
+        tx,
+        adapter,
+        project_root,
+        &path_sql,
+        &request_json,
+        storage_languages,
+        indices.len(),
+    )?;
+    for ((request_index, rows), path_units) in
+        indices.into_iter().zip(candidates).zip(path_candidates)
+    {
+        let mut units = hydrate_candidates(adapter, project_root, rows)?;
+        // `hydrate_candidates` already sorts and dedups, so the merge below is
+        // only needed when the path arm actually contributed -- which is never,
+        // for an adapter with no path-synthetic module units.
+        if !path_units.is_empty() {
+            units.extend(path_units);
+            sort_units(&mut units);
+            units.dedup();
+        }
         values[request_index] = RelationalDefinitionValue::Definitions(units);
         handled[request_index] = true;
     }
@@ -1668,6 +1795,19 @@ impl AnalyzerStore {
         if cancellation.is_cancelled() {
             return Ok(RelationalStoreOutcome::Cancelled);
         }
+        set_identifier_definition_values(
+            &tx,
+            adapter,
+            project_root,
+            storage_languages,
+            &live_unit_counts,
+            requests,
+            &mut values,
+            &mut handled,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(RelationalStoreOutcome::Cancelled);
+        }
         for (index, request) in requests.iter().enumerate() {
             if handled[index] {
                 continue;
@@ -1860,8 +2000,9 @@ mod tests {
 
     use super::{
         AnalyzerStore, PACKAGE_EXISTS_SQL, batched_content_sql, batched_definition_order_sql,
-        batched_exact_name_path_units_sql, batched_path_units_sql, content_sql,
-        path_arm_lean_units_sql, render_name, scanned_content_sql, split_view_sources,
+        batched_exact_name_path_units_sql, batched_identifier_path_units_sql,
+        batched_path_units_sql, content_sql, path_arm_lean_units_sql, render_name,
+        scanned_content_sql, split_view_sources,
     };
     use crate::analyzer::Language;
     use crate::analyzer::ProjectFile;
@@ -2297,6 +2438,11 @@ mod tests {
                 "json_extract(value, '$[0]'), json_extract(value, '$[1]')",
                 "requests.prefix = '' AND symbols.normalized_fqn = requests.tail",
             )),
+        );
+        assert_lean(
+            "identifier path-units query",
+            "idx_workspace_file_path_symbol_rows_short_name",
+            &explain(batched_identifier_path_units_sql()),
         );
     }
 
