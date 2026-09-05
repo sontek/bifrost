@@ -789,7 +789,11 @@ pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> 
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", -2048)
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "mmap_size", 0)
+    // Deliberately unmapped, unlike the pooled readers: streaming mode exists
+    // to bound memory while walking a large result set -- hence the 2 MiB cache
+    // -- and the pcache1 lock contention that motivates mapping the pooled
+    // readers has not been measured on this path.
+    conn.pragma_update(None, "mmap_size", streaming_reader_mmap_bytes())
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "query_only", "ON")
         .map_err(|err| format!("cache DB streaming read-only SQLite error: {err}"))?;
@@ -841,27 +845,92 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
 /// against 187.1 CPU-seconds), nearly all `sys`, from re-reading evicted pages.
 const READER_PAGE_CACHE_KIB: i64 = -8192;
 
+/// Environment override for the pooled readers' `mmap_size`, in bytes.
+///
+/// Set it to `0` to turn memory-mapped reads off, which sends every page back
+/// through pcache1 and its shared LRU mutex. That is an escape hatch for a host
+/// where mapping is unwanted -- scarce address space, or a filesystem where a
+/// truncated file would raise `SIGBUS` -- and costs the speedup documented on
+/// `configure_readonly_page_cache`, not a tuning value worth reaching for.
+pub const CACHE_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_MMAP_BYTES";
+/// Environment override for the streaming reader's `mmap_size`, in bytes.
+///
+/// Defaults to `0`, unmapped. See `open_streaming_readonly_connection` for why
+/// that path stays that way.
+pub const CACHE_STREAMING_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_STREAMING_MMAP_BYTES";
+/// Default `mmap_size` for a pooled reader.
+///
+/// Sized to cover a whole cache DB rather than to be frugal. `mmap_size` sets a
+/// ceiling, not an allocation: a workspace maps only the pages it touches, so a
+/// bound above its DB size costs nothing, while a bound below it leaves every
+/// page past the bound on pcache1 and its shared LRU mutex. Measured on a
+/// 22k-file workspace with a 228 MB cache DB, a 64 MiB bound still left 43% of
+/// sampled thread stacks blocked on that mutex, against 0% once the bound
+/// covered the DB, and 103s against 76s of wall clock.
+///
+/// The cost of raising it is address space, which `bifrost-analysis`'s
+/// `MAX_IDLE_READERS` bounds at that many times this value. Resident memory
+/// does not move: the growth is clean, reclaimable `RssFile`.
+const READER_MMAP_BYTES_DEFAULT: i64 = 256 * 1024 * 1024;
+/// Default `mmap_size` for the streaming reader: unmapped, see
+/// `open_streaming_readonly_connection`.
+const STREAMING_READER_MMAP_BYTES_DEFAULT: i64 = 0;
+
+/// Parse an `mmap_size` override, falling back to `default`.
+///
+/// A value that is absent, unparseable, or negative yields the default: this
+/// tunes a cache, so a malformed override must not fail an otherwise healthy
+/// open. This rejects a negative value rather than pass it through, because
+/// SQLite would read it as an enormous unsigned bound.
+fn mmap_bytes_from_env(raw: Option<&str>, default: i64) -> i64 {
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|bytes| *bytes >= 0)
+        .unwrap_or(default)
+}
+
+fn reader_mmap_bytes() -> i64 {
+    mmap_bytes_from_env(
+        std::env::var(CACHE_MMAP_BYTES_ENV).ok().as_deref(),
+        READER_MMAP_BYTES_DEFAULT,
+    )
+}
+
+fn streaming_reader_mmap_bytes() -> i64 {
+    mmap_bytes_from_env(
+        std::env::var(CACHE_STREAMING_MMAP_BYTES_ENV)
+            .ok()
+            .as_deref(),
+        STREAMING_READER_MMAP_BYTES_DEFAULT,
+    )
+}
+
 fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.pragma_update(None, "cache_size", READER_PAGE_CACHE_KIB)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    // No memory-mapped I/O. `mmap_size` is per connection, so a pool of readers
-    // maps the same file once each, and the mapped bytes scale with the host's
-    // core count as well as the DB: measured 2026-08-08, 115-125 mappings of one
-    // 176 MB cache DB held 20.0 GB of mapped address space for a whole query.
-    // mmap's only unique benefit is avoiding a copy out of the OS page cache,
-    // which matters when the DB does not fit the connection's own cache --
-    // exactly the case where the mapping cost is largest.
+    // The win from mapping is lock avoidance, not the copy out of the OS page
+    // cache: `pagerAcquireMapPage` serves a mapped page, which never enters
+    // pcache1 and so never takes pcache1's `SQLITE_MUTEX_STATIC_LRU`. Because
+    // libsqlite3-sys sets `SQLITE_ENABLE_MEMORY_MANAGEMENT`, this build shares
+    // one page-cache group across every connection, so every reader takes that
+    // one static mutex on every page fetch, hit or miss, on every worker thread
+    // -- the bottleneck under a whole-workspace fan-out.
     //
-    // This is a priced trade, not a free win. Isolated on the same cell,
-    // removing the mapping costs about 7% CPU, all of it `sys` (212.2 against
-    // 197.6 CPU-seconds; `sys` 79.6 against 70.1) from read syscalls replacing
-    // mapped loads, and wall clock does not move. It buys 20.0 GB of address
-    // space and 2.3 GB of RSS back, and it removes a ceiling that grows with
-    // both the DB size and the core count (5.55-12.3 GB on the 848 MB rustc
-    // cache, ~30 GB worst case on a 120-CPU host).
-    conn.pragma_update(None, "mmap_size", 0)
+    // Measured 2026-09-05 on a 32-core host, whole-workspace `usage_graph` to a
+    // fixed query checkpoint: a 22k-file workspace went 214s -> 103s at 64 MiB
+    // and -> 76s at 256 MiB, a 1.5k-file workspace 9.5s -> 3.3s at either size,
+    // and sampled stacks blocked on that mutex went 39.9% -> 0.0%. The two
+    // bounds differ because that workspace's DB is 228 MB: 64 MiB leaves the
+    // rest on pcache1. Raising `cache_size` instead does nothing (8 MiB against
+    // 64 MiB: 238s against 246s) -- a larger cache takes the same lock, it just
+    // misses less often.
+    //
+    // The cost is address space, not memory: anonymous RSS is unchanged (6595,
+    // 6568, 6498 MB across the three settings) and the growth is clean,
+    // reclaimable `RssFile`. `mmap_size` is a ceiling, not an allocation, so a
+    // DB smaller than the bound maps only what it has.
+    conn.pragma_update(None, "mmap_size", reader_mmap_bytes())
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
@@ -2300,6 +2369,41 @@ mod tests {
     // (issue #3016).
     use crate::cache_gc::PlannerStatisticsState;
 
+    #[test]
+    fn mmap_override_parses_and_rejects_unusable_values() {
+        let default = READER_MMAP_BYTES_DEFAULT;
+        assert_eq!(mmap_bytes_from_env(None, default), default);
+        assert_eq!(mmap_bytes_from_env(Some(""), default), default);
+        assert_eq!(mmap_bytes_from_env(Some("   "), default), default);
+        assert_eq!(mmap_bytes_from_env(Some("64MiB"), default), default);
+        // A negative bound would reach SQLite as an enormous unsigned value.
+        assert_eq!(mmap_bytes_from_env(Some("-1"), default), default);
+        // 0 is a real choice -- it restores the unmapped behavior -- so it must
+        // survive rather than being treated as "unset".
+        assert_eq!(mmap_bytes_from_env(Some("0"), default), 0);
+        assert_eq!(
+            mmap_bytes_from_env(Some(" 268435456 "), default),
+            268_435_456
+        );
+    }
+
+    #[test]
+    fn pooled_reader_maps_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(cache_db_file_name());
+        let _writer = open_unified_connection(&db_path).unwrap();
+
+        let pooled = open_readonly_temp_connection(&db_path).unwrap();
+        let mapped: i64 = pooled
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mapped, READER_MMAP_BYTES_DEFAULT,
+            "a pooled reader must map by default -- an unmapped one takes \
+             pcache1's STATIC_LRU mutex on every page fetch"
+        );
+    }
+
     /// A database with no Bifrost schema in it, in the store's own shape:
     /// incremental auto-vacuum, WAL, and one transaction that frees pages.
     fn synthetic_store_with_free_pages(path: &Path, page_size: u32) -> Connection {
@@ -3217,7 +3321,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA mmap_size", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            0
+            STREAMING_READER_MMAP_BYTES_DEFAULT
         );
         assert_eq!(
             conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
