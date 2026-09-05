@@ -801,11 +801,18 @@ pub const CACHE_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_MMAP_BYTES";
 pub const CACHE_STREAMING_MMAP_BYTES_ENV: &str = "BIFROST_CACHE_STREAMING_MMAP_BYTES";
 /// Default `mmap_size` for a pooled reader.
 ///
-/// Chosen as the knee of the measured curve rather than its maximum: 64 MiB
-/// captures the whole win on a workspace whose cache DB fits under it, and most
-/// of the win on one that does not, while bounding worst-case mapped address
-/// space to `bifrost-analysis`'s `MAX_IDLE_READERS` times this value.
-const READER_MMAP_BYTES_DEFAULT: i64 = 64 * 1024 * 1024;
+/// Sized to cover a whole cache DB rather than to be frugal. `mmap_size` sets a
+/// ceiling, not an allocation: a workspace maps only the pages it touches, so a
+/// bound above its DB size costs nothing, while a bound below it leaves every
+/// page past the bound on pcache1 and its shared LRU mutex. Measured on a
+/// 22k-file workspace with a 228 MB cache DB, a 64 MiB bound still left 43% of
+/// sampled thread stacks blocked on that mutex, against 0% once the bound
+/// covered the DB, and 103s against 76s of wall clock.
+///
+/// The cost of raising it is address space, which `bifrost-analysis`'s
+/// `MAX_IDLE_READERS` bounds at that many times this value. Resident memory
+/// does not move: the growth is clean, reclaimable `RssFile`.
+const READER_MMAP_BYTES_DEFAULT: i64 = 256 * 1024 * 1024;
 /// Default `mmap_size` for the streaming reader: unmapped, see
 /// `open_streaming_readonly_connection`.
 const STREAMING_READER_MMAP_BYTES_DEFAULT: i64 = 0;
@@ -854,9 +861,11 @@ fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     // Measured 2026-09-05 on a 32-core host, whole-workspace `usage_graph` to a
     // fixed query checkpoint: a 22k-file workspace went 214s -> 103s at 64 MiB
     // and -> 76s at 256 MiB, a 1.5k-file workspace 9.5s -> 3.3s at either size,
-    // and sampled stacks blocked on that mutex went 39.9% -> 0.0%. Raising
-    // `cache_size` instead does nothing (8 MiB against 64 MiB: 238s against
-    // 246s) -- a larger cache takes the same lock, it just misses less often.
+    // and sampled stacks blocked on that mutex went 39.9% -> 0.0%. The two
+    // bounds differ because that workspace's DB is 228 MB: 64 MiB leaves the
+    // rest on pcache1. Raising `cache_size` instead does nothing (8 MiB against
+    // 64 MiB: 238s against 246s) -- a larger cache takes the same lock, it just
+    // misses less often.
     //
     // The cost is address space, not memory: anonymous RSS is unchanged (6595,
     // 6568, 6498 MB across the three settings) and the growth is clean,
