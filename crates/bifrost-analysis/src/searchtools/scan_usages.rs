@@ -3742,9 +3742,24 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     }
     let truncated_ids = truncated_by_id.keys().cloned().collect::<HashSet<_>>();
     for (id, total_callsites) in &truncated_by_id {
-        let index = catalog
-            .index_for_id(id)
-            .expect("every exact edge endpoint is cataloged");
+        // Not every truncated id is a graph node, so this cannot assert. `truncated_by_id` is
+        // filled from two sources: the inbound edge endpoints just above, whose targets were pushed
+        // into `declarations` and are therefore cataloged, and the `legacy_truncated` loop in the
+        // frontier pass, whose target is resolved by NAME out of `endpoints_by_name` and never
+        // pushed. A target whose call sites were all dropped by the MAX_CALLSITES cap contributes no
+        // edge site, so it reaches `truncated_by_id` through that second path alone and is absent
+        // from the catalog. Asserting otherwise aborts the process instead of returning a graph, and
+        // a Rust panic crossing the PyO3 boundary is a BaseException that no caller's
+        // `except Exception` can catch: measured on cockroachdb/cockroach, every analyze_diff over
+        // the tree took the whole host process down. Record the gap the way the sibling
+        // ambiguous-target case above already does.
+        let Some(index) = catalog.index_for_id(id) else {
+            incomplete.insert((
+                "callsites_truncated".to_string(),
+                format!("call sites were truncated for {id:?}, which is not a usage-graph node"),
+            ));
+            continue;
+        };
         let node = &catalog.nodes[index];
         truncated_symbols.push(UsageGraphTruncatedSymbol {
             node_id: id.clone(),
@@ -5793,6 +5808,50 @@ mod tests {
     use super::*;
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn usage_graph_returns_when_a_truncated_target_is_not_a_graph_node() {
+        // `truncated_by_id` takes ids from two places, and only one of them feeds the catalog.
+        // A callee past MAX_CALLSITES has every call site dropped, so it contributes no edge site
+        // and is never pushed into `declarations`; it still reaches `truncated_by_id` through the
+        // name-resolved `legacy_truncated` loop. Looking that id up with `.expect()` aborted the
+        // process rather than returning a graph -- and a Rust panic crossing PyO3 is a
+        // BaseException, so no Python caller's `except Exception` could contain it. Measured on
+        // cockroachdb/cockroach, every analyze_diff over the tree took the host process down.
+        //
+        // Java, not JS/TS: `LanguageEdgeSites::Scoped` is the JS/TS-only arm, and the arm that
+        // fills `legacy_truncated` is `Fqn`, which every other language uses.
+        let callsites = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
+        let mut body = String::new();
+        for _ in 0..callsites {
+            body.push_str("    new Target().call();\n");
+        }
+        let root = format!("package app; class Root {{ void run() {{\n{body}  }} }}\n");
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                ("app/Root.java", root.as_str()),
+                ("app/Target.java", "package app; class Target { void call() {} }\n"),
+            ],
+        );
+
+        let graph = usage_graph(
+            fixture.analyzer.analyzer(),
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        // The point is that it RETURNS. Whether this target lands in `truncated_symbols` or only in
+        // `incomplete_reasons` depends on whether it was cataloged, and both are acceptable -- what
+        // must never happen is that the call does not come back at all.
+        assert!(
+            !graph.complete,
+            "a target past MAX_CALLSITES must be reported as incomplete"
+        );
+    }
 
     #[test]
     fn rooted_usage_graph_never_scans_the_workspace_declaration_inventory() {
